@@ -48,8 +48,6 @@ import {
   type StrataLayers,
 } from "./strata.ts";
 
-const WIP_COOLDOWN_MS = 60_000;
-
 interface ToolResult {
   content: { type: "text"; text: string }[];
   details: Record<string, never>;
@@ -92,8 +90,7 @@ Pipeline:
 3. Plan: write an atomic TODO list between the PLAN markers, one action per line in the format "- action". Each plan item must be a self-contained instruction: after compaction the step is executed from its own item without re-reading the history, so record enough detail in it (which files/modules are touched, exactly what to do, verification commands, expected outcome) so the task can be completed relying only on the plan and the reports. Then call strata with action="advance" — the first compaction happens at the end of the turn.
 4. Execute steps one at a time. After each completed step (code + checks), write only the step N report between the STEP-N markers — 10-30 lines: what was done, which files changed, test/build results, key decisions, risks. Then call strata with action="advance" and step=N. The raw step context is saved to ${p.tmp}/step_N_raw.md during compaction — mention that in the report.
 5. After each step call strata with action="advance" and step=N (the number of the completed step) — compaction at the end of the turn.
-6. If context is compacted while gathering information after a RESEARCH block was written but before a PLAN exists, the extension creates a WIP report and raw snapshot. Resume the research from that report, update the full RESEARCH block when findings change, then write the PLAN. Once you call advance for the plan, the research WIP is removed.
-7. The reports are the primary information store for the following steps: do not omit key facts.
+6. The reports are the primary information store for the following steps: do not omit key facts.
 
 Rules:
 - The marker blocks in the summary after compaction are the current layer state: do not repeat them unchanged; write new blocks only when a phase is updated.
@@ -163,9 +160,14 @@ function stepAdvanceError(layers: StrataLayers, n: number): string | null {
     return "Error: no PLAN block. Write the TODO list between the PLAN markers and call advance again.";
   if (n > items.length)
     return `Error: the plan has ${items.length} item(s); there is no step ${n}.`;
-  if (items.slice(0, n - 1).some((_item, index) =>
-    !(layers.reports ?? []).some((report) => report.n === index + 1),
-  ))
+  if (
+    items
+      .slice(0, n - 1)
+      .some(
+        (_item, index) =>
+          !(layers.reports ?? []).some((report) => report.n === index + 1),
+      )
+  )
     return `Error: complete the preceding plan items first: their STEP-N reports are missing.`;
   if (!(layers.reports ?? []).some((r) => r.n === n))
     return `Error: no report for step ${n}. Write it between /*STRATA::STEP-${n}::v1*/ … /*STRATA::END::STEP-${n}::v1*/ and call advance again.`;
@@ -230,18 +232,22 @@ export default function (pi: ExtensionAPI) {
   const rt: StrataRuntime = {
     strataDir: null,
     pending: null,
-    keepWipTokens: initial.keepWipTokens,
-    wipRemainingThresholdPct: initial.wipThresholdPct,
   };
   let autoContinue = initial.autoContinue;
-  let lastWipAt = 0;
+  // Set by the session_before_compact handler: did the LAST before-compact
+  // event return a strata compaction result? Used by session_compact to
+  // detect when another extension's result replaced ours (pi keeps the
+  // result of the last-loaded handler — there is no merge).
+  let compactOurs = false;
 
   const statusText = (ctx: ExtensionContext): string => {
     const dir = rt.strataDir ?? "(no session)";
     const layers = extractLayers(branchText(ctx));
     const plan = layers?.plan;
     const reports = layers?.reports ?? [];
-    const counts = plan ? reportPlanCounts(plan, reports) : { done: 0, total: 0 };
+    const counts = plan
+      ? reportPlanCounts(plan, reports)
+      : { done: 0, total: 0 };
     const nextIdx = plan ? firstUnreportedPlanStep(plan, reports) : -1;
     let next = "no plan";
     if (counts.total > 0) {
@@ -257,27 +263,58 @@ export default function (pi: ExtensionAPI) {
         rt.pending.kind === "step"
           ? `step:${rt.pending.stepN}`
           : rt.pending.kind;
-    const usage = ctx.getContextUsage();
-    const usageText =
-      usage?.percent == null ? "" : `, context ${Math.round(usage.percent)}%`;
-    return (
-      [
-        `dir: ${dir}`,
-        `research: ${layers?.research ? "yes" : "no"}`,
-        `plan: ${counts.done}/${counts.total} (${next})`,
-        `reports: [${reportNumbers.join(",")}]`,
-        `wip: ${layers?.wip ? "yes" : "no"}`,
-        `settings: wip=${rt.keepWipTokens}tok/${rt.wipRemainingThresholdPct}% auto=${autoContinue ? "on" : "off"}`,
-        `pending: ${pending}`,
-      ].join(" | ") + usageText
-    );
+    return [
+      `dir: ${dir}`,
+      `research: ${layers?.research ? "yes" : "no"}`,
+      `plan: ${counts.done}/${counts.total} (${next})`,
+      `reports: [${reportNumbers.join(",")}]`,
+      `settings: auto=${autoContinue ? "on" : "off"}`,
+      `pending: ${pending}`,
+    ].join(" | ");
+  };
+
+  // Persistent plan-execution dashboard (widget above the editor).
+  // One line, e.g.:  strata ▸ 2/5 ✓✓▶··  next: #3 install deps
+  const planWidgetLines = (ctx: ExtensionContext): string[] | undefined => {
+    const layers = extractLayers(branchText(ctx));
+    if (!layers) return undefined; // not a strata session — hide the widget
+    if (!layers.plan) {
+      return [
+        `strata ▸ ${layers.research ? "research done — plan pending" : "pre-plan"}`,
+      ];
+    }
+    const plan = layers.plan;
+    const reports = layers.reports ?? [];
+    const total = parsePlan(plan).length;
+    const completed = new Set<number>();
+    for (const r of reports) if (r.n >= 1 && r.n <= total) completed.add(r.n);
+    const done = completed.size;
+    const nextIdx = firstUnreportedPlanStep(plan, reports);
+    const bar = parsePlan(plan)
+      .map((_item, i) => {
+        if (completed.has(i + 1)) return "✓";
+        return i === nextIdx ? "▶" : "·";
+      })
+      .join("");
+    const next =
+      nextIdx >= 0
+        ? `next: #${nextIdx + 1} ${itemText(plan, nextIdx)}`
+        : "all steps completed";
+    return [`strata ▸ ${done}/${total} ${bar}  ${next}`];
+  };
+
+  const updateWidget = (ctx: ExtensionContext): void => {
+    if (ctx.hasUI) ctx.ui.setWidget("strata", planWidgetLines(ctx));
   };
 
   const autoContinueNext = (ctx: ExtensionContext): void => {
     try {
       const plan = extractLayers(branchText(ctx))?.plan;
       if (!plan) return;
-      const idx = firstUnreportedPlanStep(plan, extractLayers(branchText(ctx))?.reports ?? []);
+      const idx = firstUnreportedPlanStep(
+        plan,
+        extractLayers(branchText(ctx))?.reports ?? [],
+      );
       if (idx === -1) {
         if (ctx.hasUI)
           ctx.ui.notify("pi-strata: all plan steps completed", "info");
@@ -308,14 +345,13 @@ export default function (pi: ExtensionAPI) {
         // Pi rejects a manual compaction before invoking
         // `session_before_compact` when the whole branch fits inside its
         // `compaction.keepRecentTokens` budget. Do not leave a phase request
-        // pending in that case: a stale pending marker would block all future
-        // threshold WIP compactions.
-        if (customInstructions !== "wip") rt.pending = null;
-        else lastWipAt = 0;
+        // pending in that case: a stale pending marker would be consumed by
+        // the next unrelated compaction and mislabel it as a step/plan dump.
+        rt.pending = null;
         if (ctx.hasUI)
           ctx.ui.notify(
             err.message === "Nothing to compact (session too small)"
-              ? "pi-strata: Pi deferred compaction: the session fits in compaction.keepRecentTokens. The phase remains in context; WIP will be retried when there is discardable history."
+              ? "pi-strata: Pi deferred compaction: the session fits in compaction.keepRecentTokens. The phase remains in context; the compaction will be retried at the next advance."
               : `pi-strata: compaction failed: ${err.message}`,
             "error",
           );
@@ -323,43 +359,15 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
-  /** True when a strata phase can be safely interrupted into a WIP report. */
-  const hasWipWork = (ctx: ExtensionContext): boolean => {
-    const layers = extractLayers(branchText(ctx));
-    const researchInProgress = layers?.research !== undefined && !layers.plan;
-    const stepInProgress =
-      layers?.plan !== undefined &&
-      firstUnreportedPlanStep(layers.plan, layers.reports ?? []) !== -1;
-    return researchInProgress || stepInProgress;
-  };
-
-  /**
-   * Start a threshold WIP compaction only when Pi is idle. Calling
-   * `ctx.compact()` during `turn_end` makes Pi abort the active agent run and
-   * wait for idle first, which can race with the next turn and silently lose
-   * the intended threshold compaction.
-   */
-  const requestWipIfNeeded = (ctx: ExtensionContext): void => {
-    if (!rt.strataDir || !hasWipWork(ctx)) return;
-    const usage = ctx.getContextUsage();
-    if (!usage || usage.percent == null) return;
-    if (usage.percent < 100 - rt.wipRemainingThresholdPct) return;
-    const now = Date.now();
-    if (now - lastWipAt < WIP_COOLDOWN_MS) return;
-    lastWipAt = now;
-    requestCompact(ctx, "wip");
-  };
-
   // ------------------------------------------------------------------ events
 
   pi.on("session_start", (_event, ctx) => {
     const s = resolveStrataSettings(ctx.cwd);
-    rt.keepWipTokens = s.keepWipTokens;
-    rt.wipRemainingThresholdPct = s.wipThresholdPct;
     autoContinue = s.autoContinue;
 
     rt.strataDir = resolveStrataDir(ctx);
     rt.pending = null;
+    compactOurs = false;
 
     // pi fires no "session deleted" event: collect orphaned strata dirs of
     // sessions whose .jsonl is gone (session picker or manual deletion).
@@ -380,6 +388,7 @@ export default function (pi: ExtensionAPI) {
     if (layers && (layers.research || layers.plan) && ctx.hasUI) {
       ctx.ui.notify(`pi-strata: ${statusText(ctx)}`, "info");
     }
+    updateWidget(ctx);
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -392,20 +401,19 @@ export default function (pi: ExtensionAPI) {
     return { systemPrompt: `${event.systemPrompt}\n\n${instructions}` };
   });
 
-  pi.on("session_before_compact", (event, ctx) => {
+  pi.on("session_before_compact", async (event, ctx) => {
     // Compaction can also be the first event after `/reload` (for example an
     // automatic overflow compaction), before another agent turn has started.
     if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
-    return handleSessionBeforeCompact(event, ctx, rt);
+    const result = await handleSessionBeforeCompact(event, ctx, rt);
+    compactOurs = result?.compaction !== undefined;
+    return result;
   });
 
   pi.on("agent_settled", (_event, ctx) => {
     if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
     const pending = rt.pending;
-    if (!pending) {
-      requestWipIfNeeded(ctx);
-      return;
-    }
+    if (!pending) return;
     // Do not consume `pending` here. `ctx.compact()` starts asynchronously and
     // `session_before_compact` needs this marker to build a plan/step summary
     // (and to save the correct raw snapshot). It consumes the marker only
@@ -419,12 +427,34 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // The plan/reports live in the conversation, so every finished turn (and
+  // every compaction) can change what the dashboard shows.
+  pi.on("turn_end", (_event, ctx) => {
+    updateWidget(ctx);
+  });
+
   pi.on("session_compact", (event, ctx) => {
+    updateWidget(ctx);
+    if (!ctx.hasUI) return;
     const details = event.compactionEntry.details as StrataDetails | undefined;
-    if (details?.strata && ctx.hasUI) {
+    if (details?.strata) {
       ctx.ui.notify(
-        `pi-strata: layers compacted (${details.strata.mode})`,
+        `pi-strata: layers compacted (${details.strata.mode}${
+          details.strata.llmSummary ? ", + pi summary" : ""
+        })`,
         "info",
+      );
+    } else if (compactOurs) {
+      // We returned a strata result but the saved entry does not carry our
+      // details.strata marker: another extension's session_before_compact
+      // handler (loaded after pi-strata) replaced it — or, when pi's default
+      // ran, our result was dropped. Either way the layers are not preserved.
+      const cause = event.fromExtension
+        ? "another extension's session_before_compact handler (loaded after pi-strata) replaced it"
+        : "pi's default summarization ran instead";
+      ctx.ui.notify(
+        `pi-strata: the strata summary was not used (${cause}); the strata layers are not preserved in this summary. If several extensions handle compaction, keep only one or load pi-strata last.`,
+        "warning",
       );
     }
   });
@@ -475,6 +505,7 @@ export default function (pi: ExtensionAPI) {
 
       if (cmd !== "reset") {
         ctx.ui.notify(`pi-strata: ${statusText(ctx)}`, "info");
+        updateWidget(ctx);
         return;
       }
 

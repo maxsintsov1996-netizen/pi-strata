@@ -8,7 +8,7 @@
  *      folding, summary byte-stability, round-trips, plan parsing),
  *   2. extension wiring (factory registers events/tool/command),
  *   3. the strata tool end-to-end (advance validation against the branch),
- *   4. the session_before_compact handler (plan/step/wip/plain modes).
+ *   4. the session_before_compact handler (plan/step/plain modes).
  *
  * NOTE: this file is CJS on purpose — pi's extension loader runs jiti in a
  * CJS context, and jiti's specifier fallback for pi-ai subpaths only works
@@ -126,12 +126,12 @@ const main = async () => {
       "/*STRATA::PLAN::v1*/ unclosed plan text",
       "/*STRATA::PLAN::v1*/ bad\n/*STRATA::PLAN::v1*/ re-open\n/*STRATA::END::PLAN::v1*/",
       "/*STRATA::RESEARCH::v1*/\n   \n/*STRATA::END::RESEARCH::v1*/",
-      "/*STRATA::WIP::v1*/\nwip body\n/*STRATA::END::WIP::v1*/",
+      "/*STRATA::RESEARCH::v1*/\nvalid research\n/*STRATA::END::RESEARCH::v1*/",
     ].join("\n");
     const blocks = strata.extractStrataBlocks(text);
     assert.equal(blocks.length, 1);
-    assert.equal(blocks[0].key, "WIP");
-    assert.equal(blocks[0].text, "wip body");
+    assert.equal(blocks[0].key, "RESEARCH");
+    assert.equal(blocks[0].text, "valid research");
   });
 
   await test("buildStrataSummary: marker line, blocks in fixed order, strict seams", () => {
@@ -139,7 +139,6 @@ const main = async () => {
       research: "r",
       plan: "- [ ] a",
       reports: [{ n: 1, text: "rep" }],
-      wip: "w",
     };
     const s = strata.buildStrataSummary(layers);
     assert.ok(
@@ -153,7 +152,6 @@ const main = async () => {
     assert.ok(
       s.includes("/*STRATA::STEP-1::v1*/\nrep\n/*STRATA::END::STEP-1::v1*/"),
     );
-    assert.ok(s.includes("/*STRATA::WIP::v1*/\nw\n/*STRATA::END::WIP::v1*/"));
     // only \n\n between blocks — no single-newline seams
     assert.ok(!s.includes("*/\n/*"));
     assert.equal(strata.buildStrataSummary({ ...layers }), s);
@@ -187,7 +185,6 @@ const main = async () => {
         { n: 1, text: "rep one" },
         { n: 3, text: "rep three" },
       ],
-      wip: "wip body",
     };
     const s = strata.buildStrataSummary(layers);
     const parsed = strata.extractLayers(s);
@@ -201,7 +198,6 @@ const main = async () => {
         [3, "rep three"],
       ],
     );
-    assert.equal(parsed.wip, layers.wip);
     assert.equal(strata.buildStrataSummary(parsed), s);
   });
 
@@ -247,7 +243,7 @@ const main = async () => {
     mkdirSync(sessDir, { recursive: true });
     const mk = (name) => {
       mkdirSync(join(sessDir, name, "tmp"), { recursive: true });
-      writeFileSync(join(sessDir, name, "tmp", "wip_raw.md"), "raw\n");
+      writeFileSync(join(sessDir, name, "tmp", "step_1_raw.md"), "raw\n");
     };
     writeFileSync(join(sessDir, "a.jsonl"), "{}");
     mk("a.pi_strata");
@@ -265,7 +261,7 @@ const main = async () => {
 
   console.log("compaction.ts — session_before_compact");
 
-  const { handleSessionBeforeCompact } = await jiti.import(
+  const { handleSessionBeforeCompact, previousLlmTail } = await jiti.import(
     join(here, "compaction.ts"),
   );
 
@@ -297,14 +293,12 @@ const main = async () => {
     reason: "manual",
     willRetry: false,
     customInstructions: "test",
-    signal: new AbortController().signal,
-    branchEntries:
-      opts.branchEntries ??
-      [
-        { type: "session", id: "h" },
-        { type: "message", id: "m1", message: userMsg("task text", 1) },
-        { type: "message", id: "m2", message: assistantMsg("response text", 2) },
-      ],
+    signal: opts.signal ?? new AbortController().signal,
+    branchEntries: opts.branchEntries ?? [
+      { type: "session", id: "h" },
+      { type: "message", id: "m1", message: userMsg("task text", 1) },
+      { type: "message", id: "m2", message: assistantMsg("response text", 2) },
+    ],
     preparation: {
       firstKeptEntryId: opts.firstKept ?? "m2",
       messagesToSummarize: opts.messages ?? [],
@@ -317,31 +311,18 @@ const main = async () => {
     },
   });
 
+  const makeRt = (pending) => ({
+    strataDir: sDir,
+    pending,
+  });
+
   const makeCtx = (extra = {}) => ({
     cwd: workDir,
     hasUI: false,
     ui: { notify: () => {} },
     model: undefined,
     modelRegistry: undefined,
-    sessionManager: {
-      getSessionFile: () => join(workDir, "2026.jsonl"),
-      getSessionId: () => "test-session",
-      getBranch: () => [],
-    },
-    getContextUsage: () => ({
-      tokens: null,
-      contextWindow: 8000,
-      percent: null,
-    }),
-    compact: () => {},
     ...extra,
-  });
-
-  const makeRt = (pending) => ({
-    strataDir: sDir,
-    pending,
-    keepWipTokens: 1000,
-    wipRemainingThresholdPct: 20,
   });
 
   await test("not a strata session -> undefined (default compaction)", async () => {
@@ -418,7 +399,21 @@ const main = async () => {
     );
   });
 
-  await test("wip mode (no model): fallback WIP block + cut + wip_raw", async () => {
+  await test("previousLlmTail: strips the strata prefix, keeps the pi LLM tail", () => {
+    assert.equal(previousLlmTail(undefined), undefined);
+    const strataOnly = strata.buildStrataSummary({
+      research: "stack: node",
+      plan: "- [ ] a",
+    });
+    assert.equal(previousLlmTail(strataOnly), undefined);
+    const tail = "## Goal\nbuild a parser\n\n## Progress\n- in progress: b";
+    assert.equal(previousLlmTail(`${strataOnly}\n\n${tail}`), tail);
+    // non-strata summaries are passed through untouched
+    const nonStrata = "## Goal\nold pi summary";
+    assert.equal(previousLlmTail(nonStrata), nonStrata);
+  });
+
+  await test("plain mode: mid-step compaction keeps the layers, no extras", async () => {
     const prevSummary = strata.buildStrataSummary({
       research: "stack: node",
       plan: "- [x] a\n- [ ] b",
@@ -427,79 +422,166 @@ const main = async () => {
       previousSummary: prevSummary,
       messages: [assistantMsg("working on b...")],
     });
+    // no model in ctx -> deterministic layer dump only
     const res = await handleSessionBeforeCompact(
       event,
       makeCtx(),
       makeRt(null),
     );
     assert.ok(res?.compaction);
-    assert.equal(res.compaction.details.strata.mode, "wip");
-    assert.ok(res.compaction.details.strata.hasWip);
-    assert.ok(res.compaction.summary.includes("/*STRATA::WIP::v1*/"));
-    assert.ok(res.compaction.summary.includes("## Current Task"));
-    // history fits the budget -> pi cuts at the session header entry
-    // (findCutPoint includes metadata entries before the first message)
-    assert.equal(res.compaction.firstKeptEntryId, "h");
-    assert.ok(existsSync(join(sDir, "tmp", "wip_raw.md")));
+    assert.equal(res.compaction.details.strata.mode, "plain");
+    assert.equal(res.compaction.details.strata.llmSummary, false);
+    // Pi's default tail cut is kept untouched
+    assert.equal(res.compaction.firstKeptEntryId, "m2");
+    assert.ok(res.compaction.summary.includes("/*STRATA::RESEARCH::v1*/"));
+    assert.ok(res.compaction.summary.includes("/*STRATA::PLAN::v1*/"));
   });
 
-  await test("WIP detects PLAN markers kept in Pi's recent tail", async () => {
+  await test("plain mode: pi LLM summary is appended on top of the strata sections", async () => {
+    const prevSummary = strata.buildStrataSummary({
+      research: "stack: node",
+      plan: "- [x] a\n- [ ] b",
+    });
+    const oldTail =
+      "## Goal\nbuild a parser\n\n## Progress\n### In Progress\n- [ ] b: half done";
+    const event = makeEvent({
+      previousSummary: `${prevSummary}\n\n${oldTail}`,
+      messages: [assistantMsg("working on b...")],
+    });
+    let seen; // the preparation the summarizer received
+    const usage = {
+      input: 3,
+      output: 7,
+      cacheRead: 0,
+      cacheWrite: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    };
+    const summarizer = async (prep) => {
+      seen = prep;
+      return {
+        summary:
+          "## Goal\nbuild a parser\n\n## Progress\n### Done\n- [x] a\n### In Progress\n- [ ] b",
+        usage,
+      };
+    };
+    const res = await handleSessionBeforeCompact(
+      event,
+      makeCtx(),
+      makeRt(null),
+      { summarizePlain: summarizer },
+    );
+    assert.ok(res?.compaction);
+    assert.equal(res.compaction.details.strata.mode, "plain");
+    assert.equal(res.compaction.details.strata.llmSummary, true);
+    // the strata prefix is byte-identical, the LLM tail follows it
+    assert.equal(
+      res.compaction.summary.slice(0, prevSummary.length),
+      prevSummary,
+    );
+    assert.ok(res.compaction.summary.includes("### In Progress\n- [ ] b"));
+    assert.equal(res.compaction.usage, usage);
+    // the LLM merges its own previous tail, never the strata sections
+    assert.equal(seen.previousSummary, oldTail);
+    assert.equal(seen.messagesToSummarize.length, 1);
+  });
+
+  await test("plain mode: summarizer failure falls back to the layer dump", async () => {
+    let warnings = 0;
+    const ctx = makeCtx({
+      hasUI: true,
+      ui: {
+        notify: (_message, type) => {
+          if (type === "warning") warnings += 1;
+        },
+      },
+    });
+    const layers = { research: "stack: node", plan: "- [ ] a" };
+    const event = makeEvent({
+      previousSummary: strata.buildStrataSummary(layers),
+      messages: [assistantMsg("working...")],
+    });
+    const res = await handleSessionBeforeCompact(event, ctx, makeRt(null), {
+      summarizePlain: async () => {
+        throw new Error("llm down");
+      },
+    });
+    assert.ok(res?.compaction);
+    assert.equal(res.compaction.details.strata.mode, "plain");
+    assert.equal(res.compaction.details.strata.llmSummary, false);
+    assert.equal(res.compaction.summary, strata.buildStrataSummary(layers));
+    assert.equal(warnings, 1);
+  });
+
+  await test("plain mode: aborted summarization cancels the compaction", async () => {
+    const ac = new AbortController();
+    ac.abort();
+    const event = makeEvent({
+      previousSummary: strata.buildStrataSummary({
+        research: "stack: node",
+        plan: "- [ ] a",
+      }),
+      messages: [assistantMsg("working...")],
+      signal: ac.signal,
+    });
+    await assert.rejects(
+      handleSessionBeforeCompact(event, makeCtx(), makeRt(null), {
+        summarizePlain: async (_prep, _ctx, signal) => {
+          if (signal.aborted) throw new Error("aborted");
+          return { summary: "x" };
+        },
+      }),
+      /aborted/,
+    );
+  });
+
+  await test("plain mode sees PLAN markers kept in Pi's recent tail", async () => {
     const event = makeEvent({
       firstKept: "m2",
       messages: [assistantMsg("working; old logs are being compacted")],
       branchEntries: [
         { type: "session", id: "h" },
         { type: "message", id: "m1", message: userMsg("task text", 1) },
-        { type: "message", id: "m2", message: assistantMsg(`${R}\n${PLAN1}`, 2) },
+        {
+          type: "message",
+          id: "m2",
+          message: assistantMsg(`${R}\n${PLAN1}`, 2),
+        },
       ],
     });
-    const res = await handleSessionBeforeCompact(event, makeCtx(), makeRt(null));
+    const res = await handleSessionBeforeCompact(
+      event,
+      makeCtx(),
+      makeRt(null),
+    );
     assert.ok(res?.compaction);
-    assert.equal(res.compaction.details.strata.mode, "wip");
-    assert.equal(res.compaction.details.strata.wipPhase, "step");
+    assert.equal(res.compaction.details.strata.mode, "plain");
+    assert.ok(res.compaction.summary.includes("/*STRATA::RESEARCH::v1*/"));
     assert.ok(res.compaction.summary.includes("/*STRATA::PLAN::v1*/"));
-    assert.ok(res.compaction.summary.includes("/*STRATA::WIP::v1*/"));
   });
 
-  await test("research WIP: RESEARCH without PLAN is preserved and resumable", async () => {
+  await test("plain mode: a research-only session keeps the research block", async () => {
     const event = makeEvent({
       previousSummary: strata.buildStrataSummary({
         research: "user goal: add import\nfound: parser lives in src/parser.ts",
       }),
       messages: [assistantMsg("checking import edge cases...")],
     });
-    const res = await handleSessionBeforeCompact(event, makeCtx(), makeRt(null));
-    assert.ok(res?.compaction);
-    assert.equal(res.compaction.details.strata.mode, "wip");
-    assert.equal(res.compaction.details.strata.wipPhase, "research");
-    assert.ok(res.compaction.summary.includes("found: parser lives in src/parser.ts"));
-    assert.ok(res.compaction.summary.includes("/*STRATA::WIP::v1*/"));
-  });
-
-  await test("plan compaction clears a research WIP", async () => {
-    const event = makeEvent({
-      previousSummary: strata.buildStrataSummary({
-        research: "research complete",
-        wip: "still investigating",
-      }),
-      messages: [assistantMsg(PLAN1)],
-    });
     const res = await handleSessionBeforeCompact(
       event,
       makeCtx(),
-      makeRt({ kind: "plan" }),
+      makeRt(null),
     );
     assert.ok(res?.compaction);
-    assert.equal(res.compaction.details.strata.mode, "plan");
-    assert.equal(res.compaction.details.strata.hasWip, false);
-    assert.ok(!res.compaction.summary.includes("/*STRATA::WIP::v1*/"));
+    assert.equal(res.compaction.details.strata.mode, "plain");
+    assert.ok(
+      res.compaction.summary.includes("found: parser lives in src/parser.ts"),
+    );
   });
 
-  await test("step mode: snapshot written, WIP block dropped", async () => {
+  await test("step mode: snapshot written, deterministic summary", async () => {
     const prevSummary = strata.buildStrataSummary({
       research: "stack: node",
       plan: "- [ ] write parser\n- [ ] add tests",
-      wip: "old wip",
     });
     const step1 =
       "/*STRATA::STEP-1::v1*/\nimplemented a; files: src/a.ts; tests green\n/*STRATA::END::STEP-1::v1*/";
@@ -515,14 +597,12 @@ const main = async () => {
     assert.ok(res?.compaction);
     assert.equal(res.compaction.details.strata.mode, "step");
     assert.equal(res.compaction.details.strata.stepN, 1);
-    assert.equal(res.compaction.details.strata.hasWip, false);
     assert.ok(
       res.compaction.summary.includes(
         "/*STRATA::STEP-1::v1*/\nimplemented a; files: src/a.ts; tests green",
       ),
     );
     assert.ok(res.compaction.summary.includes("- [x] write parser"));
-    assert.ok(!res.compaction.summary.includes("/*STRATA::WIP::v1*/"));
     assert.ok(existsSync(join(sDir, "tmp", "step_1_raw.md")));
   });
 
@@ -549,7 +629,7 @@ const main = async () => {
     assert.equal(res.compaction.summary, s1);
   });
 
-  await test("completed immutable PLAN does not create a WIP", async () => {
+  await test("completed plan compacts as plain mode", async () => {
     const event = makeEvent({
       previousSummary: strata.buildStrataSummary({
         research: "stack: node",
@@ -561,20 +641,19 @@ const main = async () => {
       }),
       messages: [assistantMsg("final response")],
     });
-    const res = await handleSessionBeforeCompact(event, makeCtx(), makeRt(null));
+    const res = await handleSessionBeforeCompact(
+      event,
+      makeCtx(),
+      makeRt(null),
+    );
     assert.ok(res?.compaction);
     assert.equal(res.compaction.details.strata.mode, "plain");
-    assert.equal(res.compaction.details.strata.hasWip, false);
   });
 
   console.log("config.ts — env > config > default");
 
   const config = await jiti.import(join(here, "config.ts"));
-  const STRATA_ENV = [
-    "PI_STRATA_KEEP_WIP_TOKENS",
-    "PI_STRATA_WIP_THRESHOLD",
-    "PI_STRATA_AUTO_CONTINUE",
-  ];
+  const STRATA_ENV = ["PI_STRATA_AUTO_CONTINUE"];
   const savedEnv = Object.fromEntries(
     STRATA_ENV.map((k) => [k, process.env[k]]),
   );
@@ -593,72 +672,48 @@ const main = async () => {
     await test("defaults: no env, no settings files", () => {
       clearStrataEnv();
       assert.deepEqual(config.resolveStrataSettings(workDir, noSettings), {
-        keepWipTokens: 10000,
-        wipThresholdPct: 20,
         autoContinue: true,
       });
     });
 
     await test("global config file applies", () => {
       clearStrataEnv();
-      writeSettings(globalSettings, { piStrata: { keepWipTokens: 5000 } });
+      writeSettings(globalSettings, { piStrata: { autoContinue: false } });
       assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
-        keepWipTokens: 5000,
-        wipThresholdPct: 20,
-        autoContinue: true,
+        autoContinue: false,
       });
     });
 
     await test("project config overrides global per field", () => {
       clearStrataEnv();
       writeSettings(globalSettings, {
-        piStrata: { keepWipTokens: 5000, wipThresholdPct: 30 },
+        piStrata: { autoContinue: false },
       });
       writeSettings(projectSettings, {
-        piStrata: { keepWipTokens: 7000 },
+        piStrata: { autoContinue: true },
       });
       assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
-        keepWipTokens: 7000,
-        wipThresholdPct: 30,
         autoContinue: true,
       });
     });
 
     await test("env overrides config", () => {
-      process.env.PI_STRATA_KEEP_WIP_TOKENS = "1234";
-      process.env.PI_STRATA_WIP_THRESHOLD = "5";
+      process.env.PI_STRATA_AUTO_CONTINUE = "0";
       assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
-        keepWipTokens: 1234,
-        wipThresholdPct: 5,
-        autoContinue: true,
+        autoContinue: false,
       });
     });
 
     await test("invalid values fall through to lower levels", () => {
       clearStrataEnv();
-      writeSettings(projectSettings, {}); // drop the previous test's project override
       writeSettings(globalSettings, {
         piStrata: {
-          keepWipTokens: -5,
-          wipThresholdPct: 42,
-          autoContinue: false,
+          autoContinue: "yes", // not a boolean -> ignored
         },
       });
       assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
-        keepWipTokens: 10000, // invalid config -> default
-        wipThresholdPct: 42,
-        autoContinue: false,
+        autoContinue: true, // invalid config -> default
       });
-      process.env.PI_STRATA_WIP_THRESHOLD = "not-a-number";
-      assert.equal(
-        config.resolveStrataSettings(workDir, globalSettings).wipThresholdPct,
-        42,
-      );
-      process.env.PI_STRATA_AUTO_CONTINUE = "0";
-      assert.equal(
-        config.resolveStrataSettings(workDir, globalSettings).autoContinue,
-        false,
-      );
       process.env.PI_STRATA_AUTO_CONTINUE = "1";
       assert.equal(
         config.resolveStrataSettings(workDir, globalSettings).autoContinue,
@@ -671,8 +726,6 @@ const main = async () => {
       writeSettings(globalSettings, "{ not json");
       writeSettings(projectSettings, { theme: "dark" });
       assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
-        keepWipTokens: 10000,
-        wipThresholdPct: 20,
         autoContinue: true,
       });
     });
@@ -710,6 +763,7 @@ const main = async () => {
       "before_agent_start",
       "session_before_compact",
       "agent_settled",
+      "turn_end",
       "session_compact",
     ]) {
       assert.ok(handlers[name]?.length, `missing handler: ${name}`);
@@ -767,7 +821,7 @@ const main = async () => {
       tCtx,
     );
     assert.ok(res?.compaction);
-    assert.equal(res.compaction.details.strata.mode, "wip");
+    assert.equal(res.compaction.details.strata.mode, "plain");
   });
 
   await test("before_agent_start injects static instructions (layer 0)", () => {
@@ -928,11 +982,17 @@ implemented parser; files: src/parser.ts; tests green
     const res = await handlers.session_before_compact[0](event, tCtx);
     assert.equal(res.compaction.details.strata.mode, "step");
     assert.equal(res.compaction.details.strata.stepN, 1);
-    const status = await exec("a7", { action: "status" }, undefined, undefined, tCtx);
+    const status = await exec(
+      "a7",
+      { action: "status" },
+      undefined,
+      undefined,
+      tCtx,
+    );
     assert.ok(status.content[0].text.includes("pending: none"));
   });
 
-  await test("failed small-session phase compaction clears pending so WIP is not blocked", async () => {
+  await test("failed small-session phase compaction clears the pending marker", async () => {
     branch.length = 0;
     branch.push(branchMsg(`${R}\n${PLAN1}`, "b-small"));
     const accepted = await exec(
@@ -958,30 +1018,110 @@ implemented parser; files: src/parser.ts; tests green
     assert.ok(status.content[0].text.includes("pending: none"));
   });
 
-  await test("agent_settled starts WIP compaction at the configured remaining-context threshold", async () => {
+  await test("turn_end updates the plan dashboard widget", async () => {
     branch.length = 0;
-    branch.push({
-      type: "compaction",
-      id: "cwip",
-      summary: strata.buildStrataSummary({
-        research: "stack: node",
-        plan: "- [ ] write parser",
-      }),
-    });
-    branch.push(branchMsg("tool output that filled the context", "mwip"));
-    let compacted = null;
+    branch.push(branchMsg(`Plan:\n${PLAN1}`, "w1"));
+    branch.push(
+      branchMsg(
+        `${PLAN1}\n/*STRATA::STEP-1::v1*/\nparser done\n/*STRATA::END::STEP-1::v1*/`,
+        "w2",
+      ),
+    );
+    const widgets = [];
     const ctx = {
       ...tCtx,
-      getContextUsage: () => ({
-        tokens: 6400,
-        contextWindow: 8000,
-        percent: 80,
-      }),
-      compact: (opts) => (compacted = opts),
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        setWidget: (key, lines) => widgets.push([key, lines]),
+      },
     };
+    handlers.turn_end[0]({ type: "turn_end" }, ctx);
+    assert.deepEqual(widgets[widgets.length - 1], [
+      "strata",
+      ["strata ▸ 1/2 ✓▶  next: #2 add tests"],
+    ]);
+    // non-strata branch: the widget is hidden again
+    branch.length = 0;
+    branch.push(branchMsg("hello", "w3"));
+    handlers.turn_end[0]({ type: "turn_end" }, ctx);
+    assert.equal(widgets[widgets.length - 1][1], undefined);
+  });
+
+  await test("session_compact warns when another extension replaced the strata result", async () => {
+    const notes = [];
+    const ctx = {
+      ...tCtx,
+      hasUI: true,
+      ui: {
+        notify: (message, type) => notes.push([type, message]),
+        setWidget: () => {},
+      },
+    };
+    // the before handler returns a strata result (marks compactOurs)
+    const before = await handlers.session_before_compact[0](
+      makeEvent({ messages: [assistantMsg(`${R}\n${PLAN1}`)] }),
+      ctx,
+    );
+    assert.ok(before?.compaction);
+    assert.ok(before.compaction.details.strata);
+    notes.length = 0; // drop the plain-mode no-model fallback note
+
+    // normal: our own entry was saved -> info, no warning
+    handlers.session_compact[0](
+      {
+        type: "session_compact",
+        compactionEntry: {
+          type: "compaction",
+          id: "c-own",
+          summary: before.compaction.summary,
+          firstKeptEntryId: "m2",
+          tokensBefore: 1234,
+          fromHook: true,
+          details: before.compaction.details,
+        },
+        fromExtension: true,
+        reason: "manual",
+        willRetry: false,
+      },
+      ctx,
+    );
+    assert.ok(notes.some(([type]) => type === "info"));
+    assert.ok(!notes.some(([type]) => type === "warning"));
+
+    // conflict: another extension's entry (no strata marker) was saved
+    handlers.session_compact[0](
+      {
+        type: "session_compact",
+        compactionEntry: {
+          type: "compaction",
+          id: "c-foreign",
+          summary: "foreign summary",
+          firstKeptEntryId: "m2",
+          tokensBefore: 1234,
+          fromHook: true,
+        },
+        fromExtension: true,
+        reason: "manual",
+        willRetry: false,
+      },
+      ctx,
+    );
+    assert.ok(
+      notes.some(
+        ([type, message]) =>
+          type === "warning" && message.includes("replaced it"),
+      ),
+    );
+  });
+
+  await test("agent_settled with no pending request does nothing", async () => {
+    branch.length = 0;
+    branch.push(branchMsg(`${R}\n${PLAN1}`, "b-idle"));
+    let compacted = null;
+    const ctx = { ...tCtx, compact: (opts) => (compacted = opts) };
     await handlers.agent_settled[0]({ type: "agent_settled" }, ctx);
-    assert.ok(compacted);
-    assert.equal(compacted.customInstructions, "wip");
+    assert.equal(compacted, null);
   });
 
   rmSync(workDir, { recursive: true, force: true });

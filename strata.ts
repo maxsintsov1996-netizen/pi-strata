@@ -7,7 +7,6 @@
 //   /*STRATA::RESEARCH::v1*/ … /*STRATA::END::RESEARCH::v1*/
 //   /*STRATA::PLAN::v1*/     … /*STRATA::END::PLAN::v1*/
 //   /*STRATA::STEP-N::v1*/   … /*STRATA::END::STEP-N::v1*/
-//   /*STRATA::WIP::v1*/      … /*STRATA::END::WIP::v1*/   (extension-generated)
 //
 // Extraction semantics — "latest wins": blocks are processed in scan order
 // (previous compaction summary first, then the new conversation span), and a
@@ -20,9 +19,9 @@
 //  - extractLayers() and buildStrataSummary() are pure functions;
 //  - every block body is normalized before storage or emission;
 //  - the summary layout is fixed: marker line, then RESEARCH, PLAN,
-//    STEP-1..N (ascending), WIP — joined with exactly SEP ("\n\n");
+//    STEP-1..N (ascending) — joined with exactly SEP ("\n\n");
 //  - allowed prefix mutations: a replaced phase block (corrected research,
-//    plan checkbox toggle), an appended step report, WIP overwrite.
+//    plan checkbox toggle), an appended step report.
 //
 // The session strata directory keeps raw context snapshots only (tmp/),
 // written by the extension at compaction time.
@@ -60,7 +59,7 @@ export function normalizeText(s: string): string {
 
 /** One well-formed phase block (body already normalized). */
 export interface StrataBlock {
-  /** Phase key: "RESEARCH", "PLAN", "WIP", or "STEP-N". */
+  /** Phase key: "RESEARCH", "PLAN", or "STEP-N". */
   key: string;
   /** Step number for STEP-N blocks. */
   stepN?: number;
@@ -79,7 +78,7 @@ export function strataBlock(key: string, body: string): string {
  */
 export function extractStrataBlocks(text: string): StrataBlock[] {
   const BLOCK_RE =
-    /\/\*STRATA::(RESEARCH|PLAN|STEP-(\d+)|WIP)::v1\*\/([\s\S]*?)\/\*STRATA::END::\1::v1\*\//g;
+    /\/\*STRATA::(RESEARCH|PLAN|STEP-(\d+))::v1\*\/([\s\S]*?)\/\*STRATA::END::\1::v1\*\//g;
   const blocks: StrataBlock[] = [];
   for (let m = BLOCK_RE.exec(text); m !== null; m = BLOCK_RE.exec(text)) {
     const key = m[1];
@@ -104,7 +103,6 @@ export interface StrataLayers {
   research?: string;
   plan?: string;
   reports?: { n: number; text: string }[];
-  wip?: string;
 }
 
 /** Fold blocks into layers; undefined when there are no blocks at all. */
@@ -117,7 +115,6 @@ export function blocksToLayers(
   for (const b of blocks) {
     if (b.key === "RESEARCH") layers.research = b.text;
     else if (b.key === "PLAN") layers.plan = b.text;
-    else if (b.key === "WIP") layers.wip = b.text;
     else if (b.stepN !== undefined) {
       const i = reports.findIndex((r) => r.n === b.stepN);
       if (i >= 0) reports[i].text = b.text;
@@ -137,7 +134,7 @@ export function extractLayers(text: string): StrataLayers | undefined {
 /**
  * Build the strata summary injected as the compaction summary: the marker
  * line followed by the phase blocks in fixed order (RESEARCH, PLAN,
- * STEP-1..N ascending, WIP), joined with exactly SEP. Pure and idempotent:
+ * STEP-1..N ascending), joined with exactly SEP. Pure and idempotent:
  * identical layers always produce identical bytes.
  */
 export function buildStrataSummary(layers: StrataLayers): string {
@@ -146,7 +143,6 @@ export function buildStrataSummary(layers: StrataLayers): string {
   if (layers.plan) out.push(strataBlock("PLAN", layers.plan));
   for (const r of layers.reports ?? [])
     out.push(strataBlock(`STEP-${r.n}`, r.text));
-  if (layers.wip) out.push(strataBlock("WIP", layers.wip));
   return out.join(SEP);
 }
 
@@ -168,8 +164,7 @@ export function parsePlan(md: string): PlanItem[] {
   const items: PlanItem[] = [];
   for (const line of md.split("\n")) {
     const m = line.match(PLAN_ITEM_RE);
-    if (m)
-      items.push({ text: m[2].trim(), done: m[1]?.toLowerCase() === "x" });
+    if (m) items.push({ text: m[2].trim(), done: m[1]?.toLowerCase() === "x" });
   }
   return items;
 }
@@ -195,7 +190,9 @@ export function reportPlanCounts(
 ): { done: number; total: number } {
   const total = parsePlan(md).length;
   const completed = new Set(
-    reports.filter((report) => report.n >= 1 && report.n <= total).map((report) => report.n),
+    reports
+      .filter((report) => report.n >= 1 && report.n <= total)
+      .map((report) => report.n),
   );
   return { done: completed.size, total };
 }

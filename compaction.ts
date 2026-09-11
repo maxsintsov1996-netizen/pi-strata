@@ -1,218 +1,74 @@
 /**
  * pi-strata — compaction integration (SPEC §3, §4, §5).
  *
- * session_before_compact handler that turns every compaction of a strata
- * session into a deterministic layer dump:
+ * session_before_compact handler for strata sessions:
  *
  *   prompt after compaction = [system prompt] + [strata summary] + [kept tail]
  *
- * The strata summary is built ONLY from the marker blocks extracted from the
- * conversation — previous compaction summary first, then the messages about
- * to be discarded (latest block of each phase wins) — re-emitted in fixed
- * order with strict "\n\n" separators, so the prefix
- * [system + summary] is byte-stable across consecutive compactions and the
- * llama.cpp KV cache survives. No layer files exist: the conversation itself
- * is the storage (SPEC §2). The ephemeral span is serialized to a raw
- * snapshot in <strata>/tmp/ BEFORE the summary is returned.
+ * The strata summary's layer blocks are built ONLY from the marker blocks
+ * extracted from the conversation — previous compaction summary first, then
+ * the messages about to be discarded (latest block of each phase wins) —
+ * re-emitted in fixed order with strict "\n\n" separators, so the prefix
+ * [system + layer blocks] is byte-stable across consecutive compactions and
+ * the llama.cpp KV cache survives. No layer files exist: the conversation
+ * itself is the storage (SPEC §2).
  *
  * Modes:
- *  - "step":    a step was just completed (strata tool advance, pending set) —
- *               snapshot + drop any WIP block (replaced by the step report);
- *  - "plan":    first compaction, after the plan was written (advance) —
- *               plain dump, wins over the WIP heuristic;
- *  - "wip":     compaction while research or a step is unfinished (context
- *               threshold / overflow) — generate a WIP report with the local
- *               LLM and keep only the last `keepWipTokens` (SPEC §5: 10000);
- *  - "plain":   post-completion or otherwise unmarked compactions — no extras.
+ *  - "step":  a step was just completed (strata tool advance, pending set) —
+ *             snapshot the ephemeral span to <strata>/tmp/, deterministic
+ *             layer dump;
+ *  - "plan":  first compaction, after the plan was written (advance) —
+ *             deterministic layer dump;
+ *  - "plain": any other compaction (Pi's overflow / manual) — the layer
+ *             blocks PLUS pi's standard LLM summarization of the ephemeral
+ *             span on top of them, so in-flight work survives as a regular
+ *             pi checkpoint. Fallback (no model / auth / LLM error): the
+ *             deterministic layer dump alone.
+ *
+ * The LLM is never fed the layer blocks: pi's merge input is only its own
+ * previous LLM tail (previousLlmTail), and the summarizer is instructed not
+ * to restate the marker blocks it sees in the raw conversation.
  */
 
 import {
+  compact as piCompact,
   convertToLlm,
-  findCutPoint,
   serializeConversation,
   sessionEntryToContextMessages,
   type CompactionResult,
   type ExtensionContext,
   type SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
-import { uuidv7 } from "@earendil-works/pi-ai";
 import { join } from "node:path";
 import {
   SEP,
   STRATA_VERSION,
   buildStrataSummary,
   extractLayers,
-  firstUnreportedPlanStep,
   normalizeText,
   strataPaths,
   writeSnapshot,
-  type StrataLayers,
 } from "./strata.ts";
+
+type Preparation = SessionBeforeCompactEvent["preparation"];
+type LlmResult = Pick<CompactionResult, "summary" | "usage">;
 
 export interface StrataRuntime {
   /** Session strata directory (resolved at session_start), or null before that. */
   strataDir: string | null;
   /** Step/plan compaction queued by the strata tool; fired on agent_settled. */
   pending: { kind: "plan" | "step"; stepN?: number } | null;
-  /** Tokens to keep on top of the WIP report (SPEC §5: 10000). */
-  keepWipTokens: number;
-  /** Remaining-context percentage that arms WIP compaction (SPEC §5: 20). */
-  wipRemainingThresholdPct: number;
 }
 
 export interface StrataDetails {
   strata: {
-    mode: "plan" | "step" | "wip" | "plain";
+    mode: "plan" | "step" | "plain";
     version: string;
     stepN?: number;
     reportFiles: number[];
-    hasWip: boolean;
-    /** Phase interrupted by the WIP compaction, if applicable. */
-    wipPhase?: "research" | "step";
+    /** Plain compaction: true when the summary also carries pi's LLM summary. */
+    llmSummary: boolean;
   };
-}
-
-const WIP_MAX_TAIL_CHARS = 60_000;
-const WIP_MIN_TAIL_CHARS = 4_000;
-const WIP_MAX_OUTPUT_TOKENS = 1500;
-
-const WIP_PROMPT_STATIC = `You are the WIP (work in progress) report editor for a coding agent. Write a compact report about the unfinished phase so that after context compaction the agent can resume work seamlessly. The phase is either research/information gathering before a plan exists, or execution of a plan step.
-
-Format (strict, at most ~40 lines):
-## Current Task
-What is being done right now (1-3 lines).
-## Progress
-What is already established in the unfinished research or current step (compact list).
-## Files
-Files read/modified and why (compact list).
-## Next Action
-The exact next action to finish the research or step.
-
-Technical facts only, no meta-comments or apologies.`;
-
-type SessionEntryLike = { id: string; type: string; firstKeptEntryId?: string };
-
-/**
- * Compute the id of the first entry to keep so that the kept tail is about
- * `keepTokens` (mirrors pi's own prepareCompaction boundary walk).
- */
-function keptEntryIdForTokens(
-  branchEntries: readonly unknown[],
-  keepTokens: number,
-  fallbackId: string,
-): string {
-  const entries = branchEntries as readonly SessionEntryLike[];
-  let boundaryStart = 0;
-  let prev = -1;
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i].type === "compaction") {
-      prev = i;
-      break;
-    }
-  }
-  if (prev >= 0) {
-    const fk = entries[prev].firstKeptEntryId;
-    const idx = entries.findIndex((e) => e.id === fk);
-    boundaryStart = idx >= 0 ? idx : prev + 1;
-  }
-  const cut = findCutPoint(
-    entries as never[],
-    boundaryStart,
-    entries.length,
-    keepTokens,
-  );
-  const entry = entries[cut.firstKeptEntryIndex];
-  return entry?.id ?? fallbackId;
-}
-
-/** Budget the WIP prompt to fit small local models (chars ≈ 4 tokens). */
-function wipTailBudget(modelContextWindow: number): number {
-  return Math.min(
-    WIP_MAX_TAIL_CHARS,
-    Math.max(WIP_MIN_TAIL_CHARS, modelContextWindow * 2),
-  );
-}
-
-function wipOutputBudget(modelContextWindow: number): number {
-  return Math.min(
-    WIP_MAX_OUTPUT_TOKENS,
-    Math.max(256, Math.floor(modelContextWindow / 8)),
-  );
-}
-
-/**
- * Generate the WIP report with the active (local) model. Falls back to a
- * deterministic digest when the call fails; rethrows on abort so the
- * compaction itself is cancelled cleanly.
- */
-function deterministicWipFallback(serialized: string): string {
-  return normalizeText(
-    [
-      "## Current Task",
-      "Unfinished research or step (LLM summarization unavailable — details in the raw snapshot).",
-      "",
-      "## Progress",
-      "- see raw context (tmp/wip_raw.md)",
-      "",
-      "## Next Action",
-      "- resume the interrupted research or step",
-      "",
-      "## Raw tail",
-      serialized.slice(-2000),
-    ].join("\n"),
-  );
-}
-
-async function generateWipReport(
-  ctx: ExtensionContext,
-  layers: StrataLayers,
-  serialized: string,
-  signal: AbortSignal,
-): Promise<string> {
-  const model = ctx.model;
-  if (!model) return deterministicWipFallback(serialized);
-
-  const budget = wipTailBudget(model.contextWindow);
-  const tail =
-    serialized.length > budget
-      ? "…[earlier context omitted]…\n" + serialized.slice(-budget)
-      : serialized;
-  const base = buildStrataSummary({ ...layers, wip: undefined });
-  const prompt = [
-    WIP_PROMPT_STATIC,
-    `## Project context (immutable layers)\n${base}`,
-    `## Conversation since the last compaction\n${tail}`,
-  ].join(SEP);
-
-  try {
-    const res = await ctx.modelRegistry.complete(
-      model,
-      {
-        messages: [
-          {
-            role: "user",
-            content: [{ type: "text", text: prompt }],
-            timestamp: Date.now(),
-          },
-        ],
-      },
-      {
-        maxTokens: wipOutputBudget(model.contextWindow),
-        signal,
-        cacheRetention: "none",
-        sessionId: uuidv7(),
-      },
-    );
-    const text = res.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
-      .join("\n");
-    if (text.trim()) return normalizeText(text);
-    throw new Error("empty WIP summary");
-  } catch (err) {
-    if (signal.aborted) throw err;
-    return deterministicWipFallback(serialized);
-  }
 }
 
 /** Shape of session_before_compact handler result (structural match with pi's type). */
@@ -222,6 +78,81 @@ export type BeforeCompactResult = {
 };
 
 /**
+ * Focus passed to pi's standard summarizer on plain (overflow / manual)
+ * compactions: the strata sections are preserved by the extension, the LLM
+ * must only cover the ephemeral span.
+ */
+const PLAIN_FOCUS =
+  "The conversation contains pi-strata marker blocks (/*STRATA::...::v1*/ ... /*STRATA::END::...::v1*/) holding the task research, the plan, and the step reports. They are preserved separately by the extension and are NOT part of your summary: do not restate, quote, or duplicate them. Summarize only the ephemeral work outside those blocks: tool outputs, findings, in-progress file changes, errors, and decisions not yet recorded in a step report — enough to resume the interrupted work.";
+
+/**
+ * pi's standard summarization of the ephemeral span. Injectable for tests;
+ * the default calls pi's own compact() with the session model's auth.
+ */
+export type PlainSummarizer = (
+  preparation: Preparation,
+  ctx: ExtensionContext,
+  signal: AbortSignal,
+) => Promise<LlmResult>;
+
+/** pi's headers allow null values; compact() does not. */
+function cleanHeaders(
+  headers: Record<string, string | null> | undefined,
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers))
+    if (value !== null) out[key] = value;
+  return out;
+}
+
+async function defaultPlainSummarizer(
+  preparation: Preparation,
+  ctx: ExtensionContext,
+  signal: AbortSignal,
+): Promise<LlmResult> {
+  const model = ctx.model;
+  if (!model) throw new Error("no model selected");
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok) throw new Error(auth.error);
+  const result = await piCompact(
+    preparation,
+    model,
+    auth.apiKey,
+    cleanHeaders(auth.headers),
+    PLAIN_FOCUS,
+    signal,
+    ctx.thinkingLevel,
+    undefined,
+    auth.env,
+  );
+  return { summary: result.summary, usage: result.usage };
+}
+
+/**
+ * The non-strata part of the previous summary: the pi LLM tail of the last
+ * plain compaction. The layer blocks are re-emitted byte-identically by the
+ * extension and must not pass through the LLM again (that would break the
+ * stable prefix); the LLM only merges its own previous tail with the new
+ * ephemeral span (pi's UPDATE-prompt semantics). Non-strata summaries are
+ * passed through untouched.
+ */
+export function previousLlmTail(
+  previousSummary: string | undefined,
+): string | undefined {
+  if (!previousSummary) return undefined;
+  const layers = extractLayers(previousSummary);
+  if (layers) {
+    const canonical = buildStrataSummary(layers);
+    if (previousSummary.startsWith(canonical)) {
+      const tail = normalizeText(previousSummary.slice(canonical.length));
+      return tail === "" ? undefined : tail;
+    }
+  }
+  return previousSummary;
+}
+
+/**
  * session_before_compact handler. Returns undefined when the session is not
  * a strata session (lets pi's default compaction run).
  */
@@ -229,12 +160,14 @@ export async function handleSessionBeforeCompact(
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
   rt: StrataRuntime,
+  deps?: { summarizePlain?: PlainSummarizer },
 ): Promise<BeforeCompactResult | undefined> {
   const dir = rt.strataDir;
   if (!dir) return undefined;
 
   const p = strataPaths(dir);
-  const { preparation, branchEntries, signal } = event;
+  const { preparation, branchEntries } = event;
+  const summarizePlain = deps?.summarizePlain ?? defaultPlainSummarizer;
 
   const messagesToDiscard = [
     ...preparation.messagesToSummarize,
@@ -247,7 +180,7 @@ export async function handleSessionBeforeCompact(
   // `preparation` deliberately excludes Pi's kept tail. Marker blocks are
   // often recent (especially the PLAN written just before work starts), so
   // looking only at the discarded span can make a live strata session appear
-  // unmarked and skip WIP entirely. Include that tail for layer extraction and
+  // unmarked and lose the layers. Include that tail for layer extraction and
   // raw snapshots; it stays newer than both the previous summary and the
   // discarded span, preserving the usual "latest wins" semantics.
   const firstKeptIndex = branchEntries.findIndex(
@@ -275,14 +208,12 @@ export async function handleSessionBeforeCompact(
   // No marker blocks at all — not a strata session: keep default compaction.
   if (!layers) return undefined;
 
-  let firstKept = preparation.firstKeptEntryId;
-  let mode: "plan" | "step" | "wip" | "plain";
+  let mode: "plan" | "step" | "plain";
   let stepN: number | undefined;
-  let wipPhase: "research" | "step" | undefined;
 
   if (rt.pending?.kind === "step") {
-    // Step just completed: snapshot the ephemeral span, drop the WIP block
-    // (replaced by the step report, SPEC §5), keep pi's default tail.
+    // Step just completed: snapshot the ephemeral span before it is
+    // replaced by the step report, keep Pi's default tail.
     mode = "step";
     stepN = rt.pending.stepN;
     writeSnapshot(
@@ -290,60 +221,63 @@ export async function handleSessionBeforeCompact(
       `step ${stepN}`,
       serialized,
     );
-    layers.wip = undefined;
   } else if (rt.pending?.kind === "plan") {
-    // First compaction, after the plan was written (advance) — wins over the
-    // WIP heuristic even when the plan is fully open. A research WIP is now
-    // superseded by the completed research + plan layers.
+    // First compaction, after the plan was written (advance).
     mode = "plan";
-    layers.wip = undefined;
   } else {
-    const hasUnfinishedStep =
-      layers.plan !== undefined &&
-      firstUnreportedPlanStep(layers.plan, layers.reports ?? []) !== -1;
-    // Research starts as soon as its marker block exists. Until a PLAN block
-    // is written, its findings are still being gathered and need the same WIP
-    // protection as an unfinished implementation step.
-    const hasUnfinishedResearch = layers.research !== undefined && !layers.plan;
-    if (hasUnfinishedStep || hasUnfinishedResearch) {
-      // Mid-phase compaction (threshold / overflow / manual): WIP report on
-      // top of the layers + keep only the last keepWipTokens (SPEC §5).
-      mode = "wip";
-      wipPhase = hasUnfinishedResearch ? "research" : "step";
-      writeSnapshot(join(p.tmp, "wip_raw.md"), `WIP (${wipPhase})`, serialized);
-      layers.wip = await generateWipReport(ctx, layers, serialized, signal);
-      firstKept = keptEntryIdForTokens(
-        branchEntries,
-        rt.keepWipTokens,
-        preparation.firstKeptEntryId,
+    // Pi's overflow / manual compaction: layer dump + pi's standard
+    // summarization of the ephemeral span.
+    mode = "plain";
+  }
+
+  let llm: LlmResult | undefined;
+  if (mode === "plain") {
+    try {
+      llm = await summarizePlain(
+        {
+          ...preparation,
+          previousSummary: previousLlmTail(preparation.previousSummary),
+        },
+        ctx,
+        event.signal,
       );
-    } else {
-      mode = "plain";
+    } catch (err) {
+      if (event.signal.aborted) throw err; // compaction cancelled: propagate
+      // Local model unavailable or failed: keep the deterministic layer dump
+      // rather than failing the whole compaction.
+      if (ctx.hasUI)
+        ctx.ui.notify(
+          "pi-strata: pi summarization unavailable, keeping the layer dump only",
+          "warning",
+        );
     }
   }
 
-  const summary = buildStrataSummary(layers);
+  const strataSummary = buildStrataSummary(layers);
+  const summary = llm
+    ? `${strataSummary}${SEP}${normalizeText(llm.summary)}`
+    : strataSummary;
   const details: StrataDetails = {
     strata: {
       mode,
       version: STRATA_VERSION,
       stepN,
       reportFiles: (layers.reports ?? []).map((r) => r.n),
-      hasWip: layers.wip !== undefined,
-      wipPhase,
+      llmSummary: llm !== undefined,
     },
   };
 
   // `ctx.compact()` is asynchronous. Keep the request marker alive until this
   // hook consumes it: clearing it from `agent_settled` makes every requested
-  // plan/step compaction look like an ordinary WIP/plain compaction.
+  // plan/step compaction look like an ordinary plain compaction.
   if (rt.pending) rt.pending = null;
 
   return {
     compaction: {
       summary,
-      firstKeptEntryId: firstKept,
+      firstKeptEntryId: preparation.firstKeptEntryId,
       tokensBefore: preparation.tokensBefore,
+      usage: llm?.usage,
       details,
     },
   };
