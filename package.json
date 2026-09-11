@@ -1,0 +1,25 @@
+{
+  "name": "pi-strata",
+  "version": "0.1.0",
+  "description": "Layered KV-cache-friendly context management for pi-coding-agent with local LLMs (llama.cpp / Ollama). See SPEC.md.",
+  "type": "module",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node check.cjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2"
+  }
+}
