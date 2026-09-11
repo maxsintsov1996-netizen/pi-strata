@@ -10,7 +10,11 @@
 //
 // Extraction semantics — "latest wins": blocks are processed in scan order
 // (previous compaction summary first, then the new conversation span), and a
-// later occurrence of the same phase key replaces the earlier one. The
+// later occurrence of the same phase key replaces the earlier one. A RESEARCH
+// or PLAN block additionally marks the start of a NEW task cycle: every
+// STEP-N report that appeared before it in scan order belongs to the
+// previous cycle and is dropped (a new task must not inherit the old plan's
+// step reports). Reports written after the boundary are kept. The
 // compaction summary is the extracted blocks re-emitted in fixed order, so
 // the next extraction over (summary + new span) rebuilds the prefix
 // byte-stably without any on-disk layer state.
@@ -97,7 +101,8 @@ export function extractStrataBlocks(text: string): StrataBlock[] {
 /**
  * Layered view of the conversation: the extracted phase blocks folded with
  * "latest wins" (a later block of the same phase key replaces the earlier
- * one). `reports` is sorted by step number.
+ * one). A RESEARCH or PLAN block also starts a new task cycle and drops all
+ * STEP-N reports that appeared before it. `reports` is sorted by step number.
  */
 export interface StrataLayers {
   research?: string;
@@ -111,11 +116,15 @@ export function blocksToLayers(
 ): StrataLayers | undefined {
   if (blocks.length === 0) return undefined;
   const layers: StrataLayers = {};
-  const reports: { n: number; text: string }[] = [];
+  let reports: { n: number; text: string }[] = [];
   for (const b of blocks) {
-    if (b.key === "RESEARCH") layers.research = b.text;
-    else if (b.key === "PLAN") layers.plan = b.text;
-    else if (b.stepN !== undefined) {
+    if (b.key === "RESEARCH" || b.key === "PLAN") {
+      // New task cycle: step reports that appeared before this RESEARCH/PLAN
+      // block belong to the previous cycle and are dropped.
+      if (b.key === "RESEARCH") layers.research = b.text;
+      else layers.plan = b.text;
+      reports = [];
+    } else if (b.stepN !== undefined) {
       const i = reports.findIndex((r) => r.n === b.stepN);
       if (i >= 0) reports[i].text = b.text;
       else reports.push({ n: b.stepN, text: b.text });
@@ -176,6 +185,18 @@ export function firstUnchecked(md: string): number {
 
 export function itemText(md: string, index: number): string | undefined {
   return parsePlan(md)[index]?.text;
+}
+
+/**
+ * First sentence of a text: up to the first of [.!?] that is followed by a
+ * whitespace character or end of text (a period inside "2.0" or "e.g.0"
+ * doesn't count). Falls back to the whole text when no boundary is found.
+ * Whitespace runs are collapsed to single spaces.
+ */
+export function firstSentence(text: string): string {
+  const t = text.trim().replace(/\s+/g, " ");
+  const m = t.match(/^(.+?[.!?])(?:\s|$)/);
+  return m ? m[1] : t;
 }
 
 export function planCounts(md: string): { done: number; total: number } {

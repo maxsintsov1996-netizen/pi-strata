@@ -40,6 +40,7 @@ import {
   SEP,
   cleanupOrphanedStrataDirs,
   extractLayers,
+  firstSentence,
   firstUnreportedPlanStep,
   itemText,
   parsePlan,
@@ -75,7 +76,7 @@ export function buildStrataInstructions(strataDir: string): string {
 
 You work with a layered context so that llama.cpp can reuse the KV cache. The prompt prefix is immutable: [system] → [research] → [plan] → [step reports]. Ephemeral work (command output, current logs) is always appended at the very end of the prompt and compacted after every phase.
 
-Phase data is not stored in files: you write each phase between markers directly in your message, and the extension extracts the blocks with a regex and builds the post-compaction prefix from them. The last occurrence of each block type wins: when updating a phase, write the FULL new version between new markers.
+Phase data is not stored in files: you write each phase between markers directly in your message, and the extension extracts the blocks with a regex and builds the post-compaction prefix from them. The last occurrence of each block type wins: when updating a phase, write the FULL new version between new markers. A new RESEARCH or PLAN block starts a new task cycle: all STEP-N reports standing before it in the conversation are discarded automatically.
 
 Markers (write the tokens exactly; close every block with its END marker):
 - research:   /*STRATA::RESEARCH::v1*/ … /*STRATA::END::RESEARCH::v1*/
@@ -95,6 +96,7 @@ Pipeline:
 Rules:
 - The marker blocks in the summary after compaction are the current layer state: do not repeat them unchanged; write new blocks only when a phase is updated.
 - Keep the plan as written. Record completed work in the corresponding STEP-N report.
+- New task: when the user gives the next task after a plan is complete, start the cycle again — write a fresh RESEARCH report and a new PLAN; the previous task's step reports are dropped automatically, so the new cycle starts with a clean step history and you must not rely on the old step reports.
 - Unclosed marker blocks are dropped — close every block with its END marker before calling advance.
 - Do not hand-edit the summary after compaction — the extension generates it from the markers.`;
 }
@@ -273,6 +275,13 @@ export default function (pi: ExtensionAPI) {
     ].join(" | ");
   };
 
+  // Concise widget label: the item's first sentence, capped for the
+  // one-line UI (plan items are often one long sentence).
+  const nextLabel = (md: string, idx: number): string => {
+    const t = firstSentence(itemText(md, idx) ?? "");
+    return t.length > 56 ? `${t.slice(0, 55)}…` : t;
+  };
+
   // Persistent plan-execution dashboard (widget above the editor).
   // One line, e.g.:  strata ▸ 2/5 ✓✓▶··  next: #3 install deps
   const planWidgetLines = (ctx: ExtensionContext): string[] | undefined => {
@@ -298,7 +307,7 @@ export default function (pi: ExtensionAPI) {
       .join("");
     const next =
       nextIdx >= 0
-        ? `next: #${nextIdx + 1} ${itemText(plan, nextIdx)}`
+        ? `next: #${nextIdx + 1} ${nextLabel(plan, nextIdx)}`
         : "all steps completed";
     return [`strata ▸ ${done}/${total} ${bar}  ${next}`];
   };

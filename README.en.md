@@ -21,8 +21,11 @@ across steps:
 
 Layer data is **not stored in files**: the model writes each phase between
 unique markers directly in its reply text, and the extension extracts the
-blocks algorithmically (regex, the last block of each type wins). The
-post-compaction summary = a marker line + the extracted blocks in a fixed
+blocks algorithmically (regex, the last block of each type wins). A new
+RESEARCH or PLAN block starts a new task cycle: every STEP-N that stood
+before it in the conversation (the previous task's reports) is dropped — a
+new task does not inherit the old plan's step history. The post-compaction
+summary = a marker line + the extracted blocks in a fixed
 order (strictly joined with `\n\n`) — since the summary itself consists of
 marked blocks, the next compaction extracts the layers from (summary + new
 messages) with the same regex — the identical prefix is restored without any
@@ -30,7 +33,9 @@ files (round-trip).
 
 Nothing inside the prefix is inserted or edited "on the fly": the allowed
 mutations are only (a) a new STEP-N block (end of L3), (b) a new PLAN block
-(updated checkbox — the latest version wins). The stable prefix is
+(updated checkbox — the latest version wins), (c) a new RESEARCH/PLAN — a
+new task: all STEP-N blocks standing before it are dropped. The stable
+prefix is
 [system prompt + layer blocks]; on overflow compaction a standard pi LLM
 summary follows the blocks (see "How it works", item 4) — after the blocks,
 so the prefix is untouched.
@@ -52,6 +57,9 @@ so the prefix is untouched.
    - after each step: only a `/*STRATA::STEP-N::v1*/` block with a compact
      report → `strata(action="advance", step=N)` → compaction. PLAN stays as
      written; each completed step is recorded in its STEP-N report.
+   - a new task (after a plan is complete): the cycle restarts — a fresh
+     RESEARCH and a new PLAN; the previous task's STEP-N reports are dropped
+     automatically, and the new cycle starts with a clean step history.
    Each plan item is self-contained: detailed enough to execute the step
    after compaction without re-reading the context.
 4. `session_before_compact` — compaction of a strata session: blocks are
@@ -136,9 +144,10 @@ The effective settings are visible in `strata(action="status")` / `/strata`
 index.ts      — event registration, strata tool, /strata command
 compaction.ts — session_before_compact: plan/step/plain modes
                 (plain = strata sections + pi's standard LLM summary)
-strata.ts     — pure logic: markers, extraction, latest-wins, summary
+strata.ts     — pure logic: markers, extraction, latest-wins + cycle
+                boundary (a new RESEARCH/PLAN resets the reports), summary
                 (byte-stable), round-trip, plan parsing, snapshots
-check.cjs     — self-test (42 tests)
+check.cjs     — self-test (48 tests)
 ```
 
 ## Verification

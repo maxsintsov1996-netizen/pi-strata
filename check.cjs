@@ -114,11 +114,63 @@ const main = async () => {
     ]);
     assert.equal(layers.plan, "- [x] a\n- [ ] b");
     assert.equal(layers.research, "r1");
+    // STEP-2 stood before the new PLAN (previous cycle) -> dropped; only the
+    // report written after the boundary survives
+    assert.deepEqual(layers.reports, [{ n: 1, text: "new" }]);
+    assert.equal(strata.blocksToLayers([]), undefined);
+  });
+
+  await test("blocksToLayers: new RESEARCH+PLAN drops the previous cycle's reports", () => {
+    const layers = strata.blocksToLayers([
+      { key: "RESEARCH", text: "r1" },
+      { key: "PLAN", text: "- [ ] a\n- [ ] b" },
+      { key: "STEP-1", stepN: 1, text: "did a" },
+      { key: "STEP-2", stepN: 2, text: "did b" },
+      { key: "RESEARCH", text: "r2" },
+      { key: "PLAN", text: "- [ ] c\n- [ ] d\n- [ ] e" },
+    ]);
+    assert.equal(layers.research, "r2");
+    assert.equal(layers.plan, "- [ ] c\n- [ ] d\n- [ ] e");
+    assert.deepEqual(layers.reports, []);
+  });
+
+  await test("blocksToLayers: a new PLAN alone also resets the reports", () => {
+    const layers = strata.blocksToLayers([
+      { key: "RESEARCH", text: "r1" },
+      { key: "PLAN", text: "- [ ] a\n- [ ] b" },
+      { key: "STEP-1", stepN: 1, text: "did a" },
+      { key: "PLAN", text: "- [ ] x\n- [ ] y" },
+    ]);
+    assert.equal(layers.research, "r1");
+    assert.equal(layers.plan, "- [ ] x\n- [ ] y");
+    assert.deepEqual(layers.reports, []);
+  });
+
+  await test("blocksToLayers: reports after the new cycle boundary are kept", () => {
+    const layers = strata.blocksToLayers([
+      { key: "RESEARCH", text: "r1" },
+      { key: "PLAN", text: "- [ ] a" },
+      { key: "STEP-1", stepN: 1, text: "old a" },
+      { key: "RESEARCH", text: "r2" },
+      { key: "PLAN", text: "- [ ] b" },
+      { key: "STEP-1", stepN: 1, text: "new b" },
+    ]);
+    assert.equal(layers.research, "r2");
+    assert.equal(layers.plan, "- [ ] b");
+    assert.deepEqual(layers.reports, [{ n: 1, text: "new b" }]);
+  });
+
+  await test("blocksToLayers: no new RESEARCH/PLAN -> reports untouched", () => {
+    const layers = strata.blocksToLayers([
+      { key: "RESEARCH", text: "r1" },
+      { key: "PLAN", text: "- [ ] a\n- [ ] b" },
+      { key: "STEP-1", stepN: 1, text: "did a" },
+      { key: "STEP-2", stepN: 2, text: "did b" },
+    ]);
     assert.deepEqual(layers.reports, [
-      { n: 1, text: "new" },
+      { n: 1, text: "did a" },
       { n: 2, text: "did b" },
     ]);
-    assert.equal(strata.blocksToLayers([]), undefined);
   });
 
   await test("extractStrataBlocks: malformed pairs skipped, empty bodies dropped", () => {
@@ -226,6 +278,25 @@ const main = async () => {
       { done: 2, total: 4 },
     );
     assert.equal(strata.firstUnreportedPlanStep(raw, [{ n: 1 }, { n: 3 }]), 1);
+  });
+
+  await test("firstSentence: first sentence only, fallback to full text", () => {
+    assert.equal(
+      strata.firstSentence("write parser. Then fold layers and emit a summary"),
+      "write parser.",
+    );
+    assert.equal(
+      strata.firstSentence("run npm test! then deploy? maybe"),
+      "run npm test!",
+    );
+    assert.equal(
+      strata.firstSentence("single line without punctuation"),
+      "single line without punctuation",
+    );
+    assert.equal(
+      strata.firstSentence("  spaced out.  second  "),
+      "spaced out.",
+    );
   });
 
   const workDir = mkdtempSync(join(tmpdir(), "pi-strata-test-"));
@@ -397,6 +468,44 @@ const main = async () => {
         "- [ ] write parser\n- [ ] add tests\n/*STRATA::END::PLAN::v1*/",
       ),
     );
+  });
+
+  await test("new task: plan compaction drops the previous cycle's step reports", async () => {
+    const prevSummary = strata.buildStrataSummary({
+      research: "task one research",
+      plan: "- [ ] write parser\n- [ ] add tests",
+      reports: [
+        { n: 1, text: "did write parser" },
+        { n: 2, text: "did add tests" },
+      ],
+    });
+    const r2 =
+      "/*STRATA::RESEARCH::v1*/\nstack: node\n/*STRATA::END::RESEARCH::v1*/";
+    const plan2 =
+      "/*STRATA::PLAN::v1*/\n- [ ] build\n- [ ] test\n- [ ] ship\n/*STRATA::END::PLAN::v1*/";
+    const event = makeEvent({
+      previousSummary: prevSummary,
+      messages: [assistantMsg(`New task.\n${r2}\n${plan2}`)],
+    });
+    const res = await handleSessionBeforeCompact(
+      event,
+      makeCtx(),
+      makeRt({ kind: "plan" }),
+    );
+    assert.ok(res?.compaction);
+    assert.equal(res.compaction.details.strata.mode, "plan");
+    // no stale step reports from the previous task
+    assert.ok(!res.compaction.summary.includes("/*STRATA::STEP-1"));
+    assert.ok(!res.compaction.summary.includes("/*STRATA::STEP-2"));
+    assert.ok(!res.compaction.summary.includes("did write parser"));
+    // the new cycle's blocks are present
+    assert.ok(
+      res.compaction.summary.includes("/*STRATA::RESEARCH::v1*/\nstack: node"),
+    );
+    assert.ok(
+      res.compaction.summary.includes("- [ ] build\n- [ ] test\n- [ ] ship"),
+    );
+    assert.deepEqual(res.compaction.details.strata.reportFiles, []);
   });
 
   await test("previousLlmTail: strips the strata prefix, keeps the pi LLM tail", () => {
@@ -744,7 +853,8 @@ const main = async () => {
   const commands = {};
   const mockPi = {
     on: (name, handler) => {
-      (handlers[name] ??= []).push(handler);
+      handlers[name] ??= [];
+      handlers[name].push(handler);
     },
     registerTool: (t) => {
       tools[t.name] = t;
@@ -810,7 +920,8 @@ const main = async () => {
     const reloadedHandlers = {};
     factory({
       on: (name, handler) => {
-        (reloadedHandlers[name] ??= []).push(handler);
+        reloadedHandlers[name] ??= [];
+        reloadedHandlers[name].push(handler);
       },
       registerTool: () => {},
       registerCommand: () => {},
@@ -1046,6 +1157,59 @@ implemented parser; files: src/parser.ts; tests green
     branch.push(branchMsg("hello", "w3"));
     handlers.turn_end[0]({ type: "turn_end" }, ctx);
     assert.equal(widgets[widgets.length - 1][1], undefined);
+  });
+
+  await test("turn_end widget: next step shows the first sentence only", async () => {
+    branch.length = 0;
+    branch.push(
+      branchMsg(
+        `Plan:\n${PLAN1.replace(
+          "- [ ] write parser",
+          "- [ ] write parser. Then fold layers and emit a byte-stable summary",
+        )}`,
+        "w4",
+      ),
+    );
+    const widgets = [];
+    const ctx = {
+      ...tCtx,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        setWidget: (key, lines) => widgets.push([key, lines]),
+      },
+    };
+    handlers.turn_end[0]({ type: "turn_end" }, ctx);
+    assert.deepEqual(widgets[widgets.length - 1], [
+      "strata",
+      ["strata ▸ 0/2 ▶·  next: #1 write parser."],
+    ]);
+  });
+
+  await test("turn_end widget: long unpunctuated item is truncated at 56", async () => {
+    const long =
+      "update the blocksToLayers test in check.cjs: the report before the new PLAN is now dropped";
+    branch.length = 0;
+    branch.push(
+      branchMsg(
+        `Plan:\n/*STRATA::PLAN::v1*/\n- [ ] ${long}\n/*STRATA::END::PLAN::v1*/`,
+        "w5",
+      ),
+    );
+    const widgets = [];
+    const ctx = {
+      ...tCtx,
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        setWidget: (key, lines) => widgets.push([key, lines]),
+      },
+    };
+    handlers.turn_end[0]({ type: "turn_end" }, ctx);
+    assert.deepEqual(widgets[widgets.length - 1], [
+      "strata",
+      [`strata ▸ 0/1 ▶  next: #1 ${long.slice(0, 55)}…`],
+    ]);
   });
 
   await test("session_compact warns when another extension replaced the strata result", async () => {
