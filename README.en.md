@@ -100,14 +100,28 @@ so the prefix is untouched.
    default** and is enabled for the current session with `/strata-on`. Nothing
    is written to files: a new session (re)start (or `/reload`) begins with the
    mode off again; there is deliberately no in-session off command — off is
-   the session default. While enabled, the layer-0 instructions are appended
-   to the system prompt and compaction is intercepted (`session_before_compact`);
-   while disabled, the instructions are not added, compaction falls back to
-   pi's default, pending phase requests are dropped, and the plan widget is
-   hidden. While the plan dashboard is not visible (no strata blocks in the
-   session yet), the `strata: on|off` mode widget is shown at the bottom of
-   the screen (pi-lens style); once the dashboard is up, the mode widget is
-   hidden — the dashboard already shows the strata state. A resumed/forked strata session starts
+   the session default. While enabled, compaction is intercepted
+   (`session_before_compact`) and the model receives the layer-0 instructions
+   — in a KV-cache-friendly way: in a session that already carries context
+   they are appended as a standing message at the end of the conversation
+   (rendered as a compact expandable line in the TUI), and the system prompt
+   is updated only after the next compaction (a mid-session system-prompt
+   change would make the local model re-read the whole context, while a
+   compaction rewrites it anyway — that is where the instructions move into
+   the system prompt). In a fresh session (no context yet) the instructions
+   go into the system prompt immediately. The state is visible in
+   `strata(status)`: `sysprompt: deferred|active`. While disabled, the
+   instructions are not added, compaction falls back to pi's default, pending
+   phase requests are dropped, and the plan widget is hidden. The widgets are rendered in the pi-lens style (a component factory
+   with the TUI theme: accent — the `strata` brand, dim — secondary info,
+   colored status): the dashboard above the editor —
+   `strata  2/5 ✓✓▶··  next: #3 <title>` (✓ — success, ▶ — accent,
+   · — dim; the title is the plan item's part before the first colon), the
+   mode widget at the bottom — `strata  on|off`; the line is fitted to the
+   terminal width without wrapping. The mode widget is shown only while the
+   dashboard is not visible (no strata blocks in the session yet); once the
+   dashboard is up, the mode widget is hidden — the dashboard already shows
+   the strata state. A resumed/forked strata session starts
    off, but at session start a notice is shown: layers were found in the
    conversation, and `/strata-on` restores the pipeline. Enabling is safe:
    the layers live in the conversation and are re-extracted from the branch.
@@ -131,8 +145,9 @@ compiled by jiti in the pi runtime — no build step.
 - `/strata` — layer status; `/strata compact` — forced compaction;
   `/strata reset` — clear the session directory (`tmp/`);
 - `/strata-on` — enable the strata mode for the current session (off by
-  default; per-session state, nothing is written to files; see "How it
-  works", item 7).
+  default; per-session state, nothing is written to files; in a session with
+  context the system prompt is left untouched until the next compaction —
+  see "How it works", item 7).
 
 ## Configuration
 
@@ -180,7 +195,7 @@ compaction.ts — session_before_compact: plan/step/plain modes
 strata.ts     — pure logic: markers, extraction, latest-wins + cycle
                 boundary (a new RESEARCH/PLAN resets the reports), summary
                 (byte-stable), round-trip, plan parsing, snapshots
-check.cjs     — self-test (57 tests)
+check.cjs     — self-test (61 tests)
 ```
 
 ## Verification

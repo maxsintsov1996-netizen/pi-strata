@@ -47,6 +47,7 @@ const PI_AI_DIST = join(PI_ROOT, "node_modules/@earendil-works/pi-ai/dist");
 const jiti = createJiti(join(PI_ROOT, "dist/core/extensions/loader.js"), {
   alias: {
     "@earendil-works/pi-coding-agent": join(PI_ROOT, "dist/index.js"),
+    "@earendil-works/pi-tui": piRequire.resolve("@earendil-works/pi-tui"),
     "@earendil-works/pi-ai": join(PI_AI_DIST, "compat.js"),
     "@earendil-works/pi-ai/compat": join(PI_AI_DIST, "compat.js"),
     "@earendil-works/pi-ai/oauth": join(PI_AI_DIST, "oauth.js"),
@@ -307,6 +308,93 @@ const main = async () => {
       { done: 2, total: 4 },
     );
     assert.equal(strata.firstUnreportedPlanStep(raw, [{ n: 1 }, { n: 3 }]), 1);
+  });
+
+  const joinSegments = (segments) => segments.map((s) => s.text).join("");
+
+  await test("planItemLabel: colon cut, fallback to full text, 56 cap", () => {
+    const md =
+      "- [ ] Step 1 (Makefile): add build targets\n- [ ] just a long item without any colon in it at all here";
+    assert.equal(strata.planItemLabel(md, 0), "Step 1 (Makefile)");
+    assert.equal(
+      strata.planItemLabel(md, 1),
+      "just a long item without any colon in it at all here",
+    );
+    const long = "x".repeat(70);
+    assert.equal(
+      strata.planItemLabel(`- [ ] ${long}`, 0),
+      `${"x".repeat(55)}…`,
+    );
+    // a colon in the first position is not a boundary
+    assert.equal(strata.planItemLabel("- [ ] :nope", 0), ":nope");
+  });
+
+  await test("planDashboardSegments: pi-lens style line (brand, counter, bar, next)", () => {
+    const plan = "- [x] a\n- [x] b\n- [ ] c\n- [ ] d";
+    const segs = strata.planDashboardSegments(plan, [{ n: 1 }, { n: 2 }], true);
+    assert.equal(joinSegments(segs), " strata  2/4 ✓✓▶·  next: #3 c");
+    assert.equal(segs[0].color, "accent"); // brand
+    assert.equal(segs[1].color, "dim"); // counter
+    // bar: done=success, next=accent, todo=dim (after brand and counter)
+    const bar = segs.slice(2, 6);
+    assert.deepEqual(
+      bar.map((s) => [s.text, s.color]),
+      [
+        ["✓", "success"],
+        ["✓", "success"],
+        ["▶", "accent"],
+        ["·", "dim"],
+      ],
+    );
+    // all done
+    const done = strata.planDashboardSegments(
+      plan,
+      [{ n: 1 }, { n: 2 }, { n: 3 }, { n: 4 }],
+      true,
+    );
+    assert.equal(joinSegments(done), " strata  4/4 ✓✓✓✓  all done");
+    // no plan yet
+    assert.equal(
+      joinSegments(strata.planDashboardSegments(undefined, [], true)),
+      " strata  research done — plan pending",
+    );
+    assert.equal(
+      joinSegments(strata.planDashboardSegments(undefined, [], false)),
+      " strata  pre-plan",
+    );
+  });
+
+  await test("modeSegments: on=success, off=dim", () => {
+    assert.deepEqual(strata.modeSegments(true), [
+      { text: " strata", color: "accent" },
+      { text: "  on", color: "success" },
+    ]);
+    assert.deepEqual(strata.modeSegments(false), [
+      { text: " strata", color: "accent" },
+      { text: "  off", color: "dim" },
+    ]);
+  });
+
+  await test("visibleWidth/fitLine: ANSI-aware width and truncation", () => {
+    const dim = "\u001b[2m";
+    const reset = "\u001b[0m";
+    assert.equal(strata.visibleWidth(`${dim}abcd${reset}ef`), 6);
+    assert.equal(strata.visibleWidth("plain"), 5);
+    // short lines pass through untouched
+    assert.equal(
+      strata.fitLine(`${dim}ab${reset}cd`, 10),
+      `${dim}ab${reset}cd`,
+    );
+    // long plain lines: truncated with an ellipsis, exactly width cells
+    const long = "x".repeat(40);
+    const fitted = strata.fitLine(long, 10);
+    assert.equal(fitted, `${"x".repeat(9)}…`);
+    assert.equal(strata.visibleWidth(fitted), 10);
+    // colored lines: escapes stay intact, not counted
+    const colored = `${dim}${"y".repeat(40)}${reset}`;
+    const fittedColor = strata.fitLine(colored, 10);
+    assert.equal(fittedColor, `${dim}${"y".repeat(9)}…`);
+    assert.equal(strata.visibleWidth(fittedColor), 10);
   });
 
   const workDir = mkdtempSync(join(tmpdir(), "pi-strata-test-"));
@@ -899,6 +987,7 @@ const main = async () => {
   const tools = {};
   const commands = {};
   const transformers = [];
+  const sentMessages = [];
   const mockPi = {
     on: (name, handler) => {
       handlers[name] ??= [];
@@ -913,7 +1002,11 @@ const main = async () => {
     registerMarkdownTransformer: (fn) => {
       transformers.push(fn);
     },
+    registerMessageRenderer: () => {},
     sendUserMessage: () => {},
+    sendMessage: (msg, opts) => {
+      sentMessages.push({ msg, opts });
+    },
   };
 
   factory(mockPi);
@@ -1070,7 +1163,9 @@ const main = async () => {
         reloadedCommands[name] = def;
       },
       registerMarkdownTransformer: () => {},
+      registerMessageRenderer: () => {},
       sendUserMessage: () => {},
+      sendMessage: () => {},
     });
     // a /reload starts a fresh runtime: the mode is off again — opt in
     await reloadedCommands["strata-on"].handler("", tCtx);
@@ -1111,6 +1206,14 @@ const main = async () => {
 
   const exec = tools.strata.execute;
 
+  // Widgets are pi-lens-style component factories now: render them with a
+  // plain (colorless) theme to get the line text.
+  const plainTheme = { fg: (_color, text) => text };
+  const renderWidget = (content, width = 200) =>
+    typeof content === "function"
+      ? content({}, plainTheme).render(width)
+      : content;
+
   await test("mode: off by default; /strata-on enables it for the session only", async () => {
     const notifs = [];
     const widgets = {};
@@ -1127,7 +1230,7 @@ const main = async () => {
     };
     // fresh session: the mode is off by default (no settings/env involved)
     handlers.session_start[0]({ type: "session_start" }, cmdCtx);
-    assert.ok(widgets["strata-mode"][0].includes("strata: off"));
+    assert.deepEqual(renderWidget(widgets["strata-mode"][0]), [" strata  off"]);
     assert.equal(widgets["strata-mode"][1].placement, "belowEditor");
 
     // no layer-0 instructions
@@ -1178,7 +1281,7 @@ const main = async () => {
       settingsBefore,
       "no settings file written",
     );
-    assert.ok(widgets["strata-mode"][0].includes("strata: on"));
+    assert.deepEqual(renderWidget(widgets["strata-mode"][0]), [" strata  on"]);
     assert.ok(notifs.some(([m, l]) => l === "info" && m.includes("enabled")));
 
     // strata compaction and instructions come back
@@ -1206,7 +1309,7 @@ const main = async () => {
 
     // a new session starts off again (the mode is not persisted)
     handlers.session_start[0]({ type: "session_start" }, cmdCtx);
-    assert.ok(widgets["strata-mode"][0].includes("strata: off"));
+    assert.deepEqual(renderWidget(widgets["strata-mode"][0]), [" strata  off"]);
   });
 
   await test("strata-on: idempotent when already on", async () => {
@@ -1231,6 +1334,145 @@ const main = async () => {
       cmdCtx,
     );
     assert.ok(s.content[0].text.includes("enabled: on"));
+  });
+
+  await test("strata-on on an existing session defers the system prompt (KV-cache guard)", async () => {
+    const sent = [];
+    const h = {};
+    const cmds = {};
+    const toolsA = {};
+    factory({
+      on: (name, handler) => {
+        h[name] ??= [];
+        h[name].push(handler);
+      },
+      registerTool: (t) => {
+        toolsA[t.name] = t;
+      },
+      registerCommand: (name, def) => {
+        cmds[name] = def;
+      },
+      registerMarkdownTransformer: () => {},
+      registerMessageRenderer: () => {},
+      sendUserMessage: () => {},
+      sendMessage: (msg, opts) => sent.push({ msg, opts }),
+    });
+    const notes = [];
+    const ctx = {
+      ...tCtx,
+      hasUI: true,
+      ui: {
+        notify: (message, level) => notes.push([level, message]),
+        setWidget: () => {},
+        confirm: async () => true,
+      },
+    };
+    h.session_start[0]({ type: "session_start" }, ctx);
+    // the session already carries context (a message in the branch):
+    branch.length = 0;
+    branch.push(branchMsg("earlier work", "e1"));
+    await cmds["strata-on"].handler("", ctx);
+    // standing instructions queued for the next turn (end of the context):
+    assert.equal(sent.length, 1, "one instructions message queued");
+    assert.deepEqual(sent[0].opts, { deliverAs: "nextTurn" });
+    assert.equal(sent[0].msg.customType, "strata-instructions");
+    assert.equal(sent[0].msg.display, true);
+    assert.ok(sent[0].msg.content.includes("/*STRATA::RESEARCH::v1*/"));
+    assert.ok(sent[0].msg.content.includes(tP.tmp));
+    assert.ok(
+      notes.some(
+        ([level, message]) =>
+          level === "info" && message.includes("KV cache preserved"),
+      ),
+    );
+    // the system prompt is untouched until the next compaction:
+    assert.equal(
+      h.before_agent_start[0]({
+        type: "before_agent_start",
+        prompt: "hi",
+        systemPrompt: "BASE SYSTEM",
+        systemPromptOptions: {},
+      }),
+      undefined,
+    );
+    const statusA = (id) =>
+      toolsA.strata.execute(
+        id,
+        { action: "status" },
+        undefined,
+        undefined,
+        ctx,
+      );
+    const s1 = await statusA("kv-1");
+    assert.ok(s1.content[0].text.includes("sysprompt: deferred"));
+    // the next compaction rewrites the context: the deferral is lifted and
+    // the system prompt picks the instructions up from the next turn on:
+    h.session_compact[0](
+      {
+        type: "session_compact",
+        compactionEntry: {
+          type: "compaction",
+          id: "cA",
+          summary: "s",
+          firstKeptEntryId: "m2",
+          tokensBefore: 1,
+          fromHook: true,
+          details: {},
+        },
+        fromExtension: false,
+        reason: "manual",
+        willRetry: false,
+      },
+      ctx,
+    );
+    const res = h.before_agent_start[0]({
+      type: "before_agent_start",
+      prompt: "hi",
+      systemPrompt: "BASE SYSTEM",
+      systemPromptOptions: {},
+    });
+    assert.ok(res.systemPrompt.startsWith("BASE SYSTEM\n\n"));
+    assert.ok(res.systemPrompt.includes("PI-STRATA"));
+    const s2 = await statusA("kv-2");
+    assert.ok(s2.content[0].text.includes("sysprompt: active"));
+    assert.ok(
+      notes.some(
+        ([level, message]) =>
+          level === "info" && message.includes("moved to the system prompt"),
+      ),
+    );
+  });
+
+  await test("strata-on on an empty session updates the system prompt immediately", async () => {
+    const sent = [];
+    const h = {};
+    const cmds = {};
+    factory({
+      on: (name, handler) => {
+        h[name] ??= [];
+        h[name].push(handler);
+      },
+      registerTool: () => {},
+      registerCommand: (name, def) => {
+        cmds[name] = def;
+      },
+      registerMarkdownTransformer: () => {},
+      registerMessageRenderer: () => {},
+      sendUserMessage: () => {},
+      sendMessage: (msg, opts) => sent.push({ msg, opts }),
+    });
+    h.session_start[0]({ type: "session_start" }, tCtx);
+    branch.length = 0; // fresh session: no LLM context yet
+    await cmds["strata-on"].handler("", tCtx);
+    assert.equal(sent.length, 0, "no message queued on a fresh session");
+    const res = h.before_agent_start[0]({
+      type: "before_agent_start",
+      prompt: "hi",
+      systemPrompt: "BASE SYSTEM",
+      systemPromptOptions: {},
+    });
+    assert.ok(res.systemPrompt.startsWith("BASE SYSTEM\n\n"));
+    assert.ok(res.systemPrompt.includes("PI-STRATA"));
   });
 
   await test("advance: validation errors (no blocks / no plan / step without report / unchecked item)", async () => {
@@ -1425,9 +1667,8 @@ implemented parser; files: src/parser.ts; tests green
       return null;
     };
     handlers.turn_end[0]({ type: "turn_end" }, ctx);
-    assert.deepEqual(lastSet("strata"), [
-      "strata",
-      ["strata ▸ 1/2 ✓▶  next: #2 add tests"],
+    assert.deepEqual(renderWidget(lastSet("strata")[1]), [
+      " strata  1/2 ✓▶  next: #2 add tests",
     ]);
     // the mode indicator is redundant while the dashboard is visible
     assert.deepEqual(lastSet("strata-mode"), ["strata-mode", undefined]);
@@ -1436,7 +1677,7 @@ implemented parser; files: src/parser.ts; tests green
     branch.push(branchMsg("hello", "w3"));
     handlers.turn_end[0]({ type: "turn_end" }, ctx);
     assert.equal(lastSet("strata")[1], undefined);
-    assert.deepEqual(lastSet("strata-mode"), ["strata-mode", ["strata: on"]]);
+    assert.deepEqual(renderWidget(lastSet("strata-mode")[1]), [" strata  on"]);
   });
 
   await test("turn_end widget: next label is the item part before the first colon", async () => {
@@ -1459,10 +1700,13 @@ implemented parser; files: src/parser.ts; tests green
     handlers.turn_end[0]({ type: "turn_end" }, ctx);
     // the first set of the turn is the dashboard (the mode widget is
     // cleared behind it — redundant while the dashboard is visible)
-    assert.deepEqual(widgets[0], [
-      "strata",
-      ["strata ▸ 0/2 ▶·  next: #1 Step 1 (Makefile)"],
+    assert.deepEqual(renderWidget(widgets[0][1]), [
+      " strata  0/2 ▶·  next: #1 Step 1 (Makefile)",
     ]);
+    // narrow terminal: the line is fitted to the width, not wrapped
+    const narrow = renderWidget(widgets[0][1], 20);
+    assert.equal(strata.visibleWidth(narrow[0]), 20);
+    assert.ok(narrow[0].endsWith("…"));
   });
 
   await test("turn_end widget: colon-less next label is truncated at 56", async () => {
@@ -1487,9 +1731,8 @@ implemented parser; files: src/parser.ts; tests green
       },
     };
     handlers.turn_end[0]({ type: "turn_end" }, ctx);
-    assert.deepEqual(widgets[0], [
-      "strata",
-      [`strata ▸ 0/1 ▶  next: #1 ${long.slice(0, 55)}…`],
+    assert.deepEqual(renderWidget(widgets[0][1]), [
+      ` strata  0/1 ▶  next: #1 ${long.slice(0, 55)}…`,
     ]);
   });
 

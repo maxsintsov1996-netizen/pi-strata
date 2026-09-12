@@ -15,6 +15,9 @@
       "@earendil-works/pi-ai": [
         "/home/max/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/index.d.ts"
       ],
+      "@earendil-works/pi-tui": [
+        "/home/max/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui"
+      ],
       "typebox": [
         "/home/max/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/typebox"
       ],

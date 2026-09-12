@@ -237,6 +237,130 @@ export function firstUnreportedPlanStep(
 }
 
 // ---------------------------------------------------------------------------
+// Widgets (pi-lens style): themeable single-line segments
+// ---------------------------------------------------------------------------
+
+/** Theme colors the widgets use (a subset of pi's ThemeColor). */
+export type WidgetColor = "accent" | "dim" | "success";
+
+/** One colored run of a widget line. */
+export interface WidgetSegment {
+  text: string;
+  color?: WidgetColor;
+}
+
+/**
+ * Short label for a plan item on the one-line dashboard: the part before
+ * the first colon (plan items are usually written as "Step N (target):
+ * details"), falling back to the full text, capped at 56 chars.
+ */
+export function planItemLabel(md: string, index: number): string {
+  const t = (itemText(md, index) ?? "").trim();
+  const cut = t.indexOf(":");
+  const label = cut > 0 ? t.slice(0, cut).trim() : t;
+  return label.length > 56 ? `${label.slice(0, 55)}…` : label;
+}
+
+/**
+ * The plan dashboard as a single line of segments (pi-lens style: leading
+ * space, accent brand, dim secondary info, colored status):
+ *
+ *   " strata  2/5 ✓✓▶··  next: #3 <label>"   (✓ success, ▶ accent, · dim)
+ *   " strata  research done — plan pending"  (no plan yet)
+ *   " strata  pre-plan"                      (no research yet)
+ */
+export function planDashboardSegments(
+  plan: string | undefined,
+  reports: readonly { n: number }[],
+  hasResearch: boolean,
+): WidgetSegment[] {
+  const brand: WidgetSegment = { text: " strata", color: "accent" };
+  if (!plan) {
+    return [
+      brand,
+      {
+        text: `  ${hasResearch ? "research done — plan pending" : "pre-plan"}`,
+        color: "dim",
+      },
+    ];
+  }
+  const total = parsePlan(plan).length;
+  const completed = new Set<number>();
+  for (const report of reports) {
+    if (report.n >= 1 && report.n <= total) completed.add(report.n);
+  }
+  const done = completed.size;
+  const nextIdx = firstUnreportedPlanStep(plan, reports);
+  const segments: WidgetSegment[] = [
+    brand,
+    { text: `  ${done}/${total} `, color: "dim" },
+  ];
+  for (let i = 0; i < total; i++) {
+    if (completed.has(i + 1)) segments.push({ text: "✓", color: "success" });
+    else if (i === nextIdx) segments.push({ text: "▶", color: "accent" });
+    else segments.push({ text: "·", color: "dim" });
+  }
+  if (nextIdx >= 0) {
+    segments.push({ text: `  next: #${nextIdx + 1} `, color: "dim" });
+    segments.push({ text: planItemLabel(plan, nextIdx) });
+  } else {
+    segments.push({ text: "  all done", color: "success" });
+  }
+  return segments;
+}
+
+/** The mode indicator line (below the editor), pi-lens style. */
+export function modeSegments(enabled: boolean): WidgetSegment[] {
+  return enabled
+    ? [
+        { text: " strata", color: "accent" },
+        { text: "  on", color: "success" },
+      ]
+    : [
+        { text: " strata", color: "accent" },
+        { text: "  off", color: "dim" },
+      ];
+}
+
+// ---------------------------------------------------------------------------
+// TUI text fitting: widget lines must not wrap on narrow terminals
+// ---------------------------------------------------------------------------
+
+const SGR_RE = /\x1b\[[0-9;]*m/g;
+
+/** Terminal cell width of a string (ANSI SGR escapes excluded). */
+export function visibleWidth(s: string): number {
+  return s.replace(SGR_RE, "").length;
+}
+
+/**
+ * Truncate a (possibly colored) line to the terminal width, replacing the
+ * tail with an ellipsis. ANSI escapes are kept intact and never counted.
+ */
+export function fitLine(s: string, maxWidth: number): string {
+  const w = Math.max(1, Math.floor(maxWidth));
+  if (visibleWidth(s) <= w) return s;
+  const limit = w - 1; // room for the ellipsis
+  let visible = 0;
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\x1b") {
+      const m = /^\x1b\[[0-9;]*m/.exec(s.slice(i));
+      if (m) {
+        out += m[0];
+        i += m[0].length - 1;
+        continue;
+      }
+    }
+    if (visible >= limit) break;
+    out += ch;
+    visible += 1;
+  }
+  return `${out}…`;
+}
+
+// ---------------------------------------------------------------------------
 // Session strata directory: raw context snapshots (tmp/) only
 // ---------------------------------------------------------------------------
 

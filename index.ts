@@ -23,10 +23,13 @@
 
 import {
   getAgentDir,
+  sessionEntryToContextMessages,
   type ExtensionAPI,
   type ExtensionContext,
+  type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { Type } from "typebox";
@@ -40,14 +43,26 @@ import {
   SEP,
   cleanupOrphanedStrataDirs,
   extractLayers,
+  fitLine,
   firstUnreportedPlanStep,
   itemText,
+  modeSegments,
   parsePlan,
+  planDashboardSegments,
   reportPlanCounts,
   strataPaths,
   stripStrataMarkersForDisplay,
   type StrataLayers,
+  type WidgetSegment,
 } from "./strata.ts";
+
+/**
+ * customType of the standing-instructions message injected by /strata-on in
+ * a session that already carries context (KV-cache guard: the system prompt
+ * must not change mid-session, so the layer-0 instructions ride on a message
+ * appended at the end of the context until the next compaction).
+ */
+const INSTRUCTIONS_CUSTOM_TYPE = "strata-instructions";
 
 interface ToolResult {
   content: { type: "text"; text: string }[];
@@ -99,6 +114,34 @@ Rules:
 - New task: when the user gives the next task after a plan is complete, start the cycle again — write a fresh RESEARCH report and a new PLAN; the previous task's step reports are dropped automatically, so the new cycle starts with a clean step history and you must not rely on the old step reports.
 - Unclosed marker blocks are dropped — close every block with its END marker before calling advance.
 - Do not hand-edit the summary after compaction — the extension generates it from the markers.`;
+}
+
+/**
+ * True when the branch already carries LLM context: any session entry that
+ * produces context messages (a message, a compaction summary, …). A
+ * mid-session system-prompt change in that case would invalidate the whole
+ * KV-cache prefix and make the local model re-read the entire session.
+ */
+function branchHasContext(ctx: ExtensionContext): boolean {
+  const branch = ctx.sessionManager.getBranch();
+  return branch.some(
+    (entry) => sessionEntryToContextMessages(entry as never).length > 0,
+  );
+}
+
+/**
+ * The standing instructions delivered by /strata-on in a session that already
+ * has context: a short activation notice plus the exact layer-0 body (kept
+ * byte-identical to buildStrataInstructions, so after the system prompt picks
+ * the instructions up the model sees the same protocol it followed before).
+ */
+export function buildStrataActivationMessage(strataDir: string): string {
+  return (
+    "[pi-strata] Layered-context mode is now ON for this session (enabled via /strata-on). " +
+    "The standing instructions below apply to every turn of this session; after the next " +
+    `compaction they move into the system prompt and this message is dropped.\n\n` +
+    buildStrataInstructions(strataDir)
+  );
 }
 
 /**
@@ -240,6 +283,15 @@ export default function (pi: ExtensionAPI) {
   // (re)start or /reload begins with it off again. There is deliberately no
   // in-session off command: off is the session default.
   let enabled = false;
+  // KV-cache guard: when /strata-on enables the mode in a session that
+  // already carries context, the system prompt must not change immediately
+  // (that would invalidate the whole cached prefix). The layer-0
+  // instructions are delivered as a message at the end of the context
+  // instead, and the system prompt picks them up only after the next
+  // compaction — which rewrites the context anyway (session_compact lifts
+  // the deferral). Fresh sessions take the immediate path (nothing to
+  // protect).
+  let deferSystemPrompt = false;
   let autoContinue = initial.autoContinue;
   let hideAnchors = initial.hideAnchors;
   // Set by the session_before_compact handler: did the LAST before-compact
@@ -247,6 +299,25 @@ export default function (pi: ExtensionAPI) {
   // detect when another extension's result replaced ours (pi keeps the
   // result of the last-loaded handler — there is no merge).
   let compactOurs = false;
+
+  // Compact TUI rendering for the standing-instructions message
+  // (INSTRUCTIONS_CUSTOM_TYPE): one line by default, expandable to the full
+  // text — the raw instructions are long and would flood the transcript.
+  pi.registerMessageRenderer(
+    INSTRUCTIONS_CUSTOM_TYPE,
+    (message, { expanded, outputPad }, theme) => {
+      const line =
+        expanded && typeof message.content === "string"
+          ? message.content
+          : `${theme.fg("accent", "strata")} ${theme.fg(
+              "dim",
+              "standing instructions attached (move to the system prompt after the next compaction)",
+            )}`;
+      const box = new Box(outputPad, 1, (t) => theme.bg("customMessageBg", t));
+      box.addChild(new Text(line, 0, 0));
+      return box;
+    },
+  );
 
   // Display-only: hide the STRATA marker anchors in the TUI transcript
   // (config hideAnchors, default on; re-resolved on session_start). pi's
@@ -286,6 +357,7 @@ export default function (pi: ExtensionAPI) {
     return [
       `dir: ${dir}`,
       `enabled: ${enabled ? "on" : "off"}`,
+      `sysprompt: ${deferSystemPrompt ? "deferred (next compaction)" : "active"}`,
       `research: ${layers?.research ? "yes" : "no"}`,
       `plan: ${counts.done}/${counts.total} (${next})`,
       `reports: [${reportNumbers.join(",")}]`,
@@ -294,65 +366,63 @@ export default function (pi: ExtensionAPI) {
     ].join(" | ");
   };
 
-  // Concise widget label: the part of the item before the first colon —
-  // plan items are usually written as "Step N (target): details", and only
-  // the title belongs on the one-line UI. Items without a colon fall back
-  // to the full text, capped at 56 chars.
-  const nextLabel = (md: string, idx: number): string => {
-    const t = (itemText(md, idx) ?? "").trim();
-    const cut = t.indexOf(":");
-    const label = cut > 0 ? t.slice(0, cut).trim() : t;
-    return label.length > 56 ? `${label.slice(0, 55)}…` : label;
-  };
-
-  // Persistent plan-execution dashboard (widget above the editor).
-  // One line, e.g.:  strata ▸ 2/5 ✓✓▶··  next: #3 install deps
-  const planWidgetLines = (ctx: ExtensionContext): string[] | undefined => {
-    const layers = extractLayers(branchText(ctx));
-    if (!layers) return undefined; // not a strata session — hide the widget
-    if (!layers.plan) {
-      return [
-        `strata ▸ ${layers.research ? "research done — plan pending" : "pre-plan"}`,
-      ];
-    }
-    const plan = layers.plan;
-    const reports = layers.reports ?? [];
-    const total = parsePlan(plan).length;
-    const completed = new Set<number>();
-    for (const r of reports) if (r.n >= 1 && r.n <= total) completed.add(r.n);
-    const done = completed.size;
-    const nextIdx = firstUnreportedPlanStep(plan, reports);
-    const bar = parsePlan(plan)
-      .map((_item, i) => {
-        if (completed.has(i + 1)) return "✓";
-        return i === nextIdx ? "▶" : "·";
-      })
-      .join("");
-    const next =
-      nextIdx >= 0
-        ? `next: #${nextIdx + 1} ${nextLabel(plan, nextIdx)}`
-        : "all steps completed";
-    return [`strata ▸ ${done}/${total} ${bar}  ${next}`];
+  // pi-lens-style widget rendering: paint the themeable segments with the
+  // current theme and fit the single line to the terminal width (widgets
+  // must not wrap). The setWidget factory is invoked on every update, so
+  // the captured segments are always fresh; render() only applies colors.
+  const renderSegments = (
+    segments: WidgetSegment[],
+    theme: Theme,
+    width: number,
+  ): string[] => {
+    const paint = (seg: WidgetSegment): string => {
+      if (seg.color === undefined) return seg.text;
+      return theme.fg(seg.color, seg.text);
+    };
+    return [fitLine(segments.map(paint).join(""), width)];
   };
 
   // Keeps both strata widgets in sync (call this whenever the conversation
   // or the mode can have changed).
   const updateWidget = (ctx: ExtensionContext): void => {
     if (!ctx.hasUI) return;
+    const layers = extractLayers(branchText(ctx));
     // The plan dashboard (above the editor) is a strata-session feature:
     // hidden while the mode is off (and for non-strata sessions, as before).
-    const lines = enabled ? planWidgetLines(ctx) : undefined;
-    ctx.ui.setWidget("strata", lines);
+    // One line, e.g.:  strata  2/5 ✓✓▶··  next: #3 install deps
+    const dashboard =
+      enabled && layers
+        ? planDashboardSegments(
+            layers.plan,
+            layers.reports ?? [],
+            layers.research !== undefined,
+          )
+        : undefined;
+    if (dashboard) {
+      ctx.ui.setWidget("strata", (_tui, theme) => ({
+        render: (width) => renderSegments(dashboard, theme, width),
+        invalidate: () => {}, // stateless: render recomputes from captured segments
+      }));
+    } else {
+      ctx.ui.setWidget("strata", undefined);
+    }
     // Mode indicator (below the editor, pi-lens style): redundant while the
     // dashboard is visible — it already shows the strata state. Shown only
     // while the dashboard is hidden, so the session default (off) or an
     // explicit /strata-on is never a surprise.
-    const modeLabel = `strata: ${enabled ? "on" : "off"}`;
-    ctx.ui.setWidget(
-      "strata-mode",
-      lines === undefined ? [modeLabel] : undefined,
-      { placement: "belowEditor" },
-    );
+    if (dashboard) {
+      ctx.ui.setWidget("strata-mode", undefined);
+    } else {
+      const segments = modeSegments(enabled);
+      ctx.ui.setWidget(
+        "strata-mode",
+        (_tui, theme) => ({
+          render: (width) => renderSegments(segments, theme, width),
+          invalidate: () => {}, // stateless: render recomputes from captured segments
+        }),
+        { placement: "belowEditor" },
+      );
+    }
   };
 
   const autoContinueNext = (ctx: ExtensionContext): void => {
@@ -414,6 +484,7 @@ export default function (pi: ExtensionAPI) {
     // The mode is session state: every (re)started session begins off; the
     // user opts in with /strata-on (nothing is persisted).
     enabled = false;
+    deferSystemPrompt = false;
     autoContinue = s.autoContinue;
     hideAnchors = s.hideAnchors;
 
@@ -455,6 +526,13 @@ export default function (pi: ExtensionAPI) {
     // instructions and can intercept compaction.
     if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
     if (!enabled) return; // disabled: no layer-0 instructions this turn
+    if (deferSystemPrompt) {
+      // KV-cache guard: the standing instructions ride on the injected
+      // message until the next compaction (session_compact lifts the
+      // deferral) — changing the system prompt here would invalidate the
+      // whole cached prefix and make the model re-read the session.
+      return;
+    }
     const instructions = buildStrataInstructions(rt.strataDir);
     return { systemPrompt: `${event.systemPrompt}\n\n${instructions}` };
   });
@@ -504,6 +582,18 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_compact", (event, ctx) => {
     updateWidget(ctx);
+    // The compaction just rewrote the context: swapping the system prompt now
+    // costs no cached prefix, so lift the KV-cache deferral — from the next
+    // turn on the layer-0 instructions live in the system prompt (the
+    // injected message is consumed by this or the next compaction).
+    if (deferSystemPrompt) {
+      deferSystemPrompt = false;
+      if (ctx.hasUI)
+        ctx.ui.notify(
+          "pi-strata: layer-0 instructions moved to the system prompt",
+          "info",
+        );
+    }
     if (!ctx.hasUI) return;
     const details = event.compactionEntry.details as StrataDetails | undefined;
     if (details?.strata) {
@@ -616,12 +706,40 @@ export default function (pi: ExtensionAPI) {
         if (ctx.hasUI) ctx.ui.notify("pi-strata: already on", "info");
         return;
       }
+      if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
       enabled = true;
       rt.pending = null; // a stale phase request must not outlive the switch
+      // KV-cache guard: in a session that already carries context, changing
+      // the system prompt now would invalidate the whole cached prefix and
+      // make the local model re-read the entire session. Deliver the layer-0
+      // instructions as a standing message appended at the end of the
+      // context instead; the next compaction rewrites the context anyway, so
+      // the system prompt picks them up then (session_compact lifts the
+      // deferral). A fresh session takes the immediate path (nothing to
+      // protect).
+      deferSystemPrompt = branchHasContext(ctx);
       updateWidget(ctx);
       if (!ctx.hasUI) return;
       const layers = extractLayers(branchText(ctx));
-      if (layers && (layers.research || layers.plan)) {
+      const hasLayers = Boolean(layers && (layers.research || layers.plan));
+      if (deferSystemPrompt) {
+        pi.sendMessage(
+          {
+            customType: INSTRUCTIONS_CUSTOM_TYPE,
+            content: buildStrataActivationMessage(rt.strataDir),
+            display: true,
+          },
+          { deliverAs: "nextTurn" },
+        );
+        // Resumed/forked strata sessions re-announce the layer state, as
+        // before; plain sessions get the generic notice only.
+        ctx.ui.notify(
+          `pi-strata: enabled — standing instructions queued at the end of the context; the system prompt picks them up after the next compaction (KV cache preserved).${hasLayers ? ` ${statusText(ctx)}` : ""}`,
+          "info",
+        );
+        return;
+      }
+      if (hasLayers) {
         // Session already carries strata layers (resumed/forked): re-announce
         // the current state instead of a generic notice.
         ctx.ui.notify(`pi-strata: ${statusText(ctx)}`, "info");
