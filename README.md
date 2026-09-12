@@ -59,6 +59,13 @@ regex — идентичный префикс восстанавливается
      автоматически, новый цикл стартует с чистой историей шагов.
    Каждый пункт плана самодостаточен: с деталями, достаточными для выполнения
    шага после компактизации, без перечитывания контекста.
+   Якоря `/*STRATA::…*/` в транскрипте TUI не показываются (display-only:
+   markdown-трансформер pi срезает их перед рендерингом — в тексте и
+   thinking ассистента, включая стриминг); сами блоки фаз при этом видны.
+   Сессия, контекст модели и summary хранят исходные маркеры — извлечение
+   не затрагивается. Отключается `piStrata.hideAnchors: false` /
+   `PI_STRATA_HIDE_ANCHORS=0` (перепроверяется на `session_start`; текущее
+   значение видно в `/strata`: `anchors=hidden|shown`).
 4. `session_before_compact` — компактизация strata-сессии: блоки извлекаются
    regex'ом из (прежняя summary + новые сообщения), последний блок каждого типа
    побеждает, summary = детерминированная сборка (результат `custom summary`).
@@ -120,7 +127,8 @@ cp -r pi-strata ~/.pi/agent/extensions/pi-strata
 ```json
 {
   "piStrata": {
-    "autoContinue": true
+    "autoContinue": true,
+    "hideAnchors": true
   }
 }
 ```
@@ -130,6 +138,7 @@ cp -r pi-strata ~/.pi/agent/extensions/pi-strata
 | Переменная | Поле конфига | По умолчанию | Описание |
 | --- | --- | --- | --- |
 | `PI_STRATA_AUTO_CONTINUE` | `autoContinue` | вкл | авто-продолжение следующего шага после компактизации (`0` — выкл) |
+| `PI_STRATA_HIDE_ANCHORS` | `hideAnchors` | вкл | скрывать STRATA-якоря в транскрипте TUI (display-only; `0` — показывать) |
 | `PI_ROOT` | — | глобальный install | путь к pi-coding-agent (только для self-test) |
 
 Эффективные настройки видны в `strata(action="status")` / `/strata` (строка `settings: ...`).

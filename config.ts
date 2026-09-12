@@ -11,7 +11,8 @@
  * Example (.pi/settings.json):
  *   {
  *     "piStrata": {
- *       "autoContinue": false
+ *       "autoContinue": false,
+ *       "hideAnchors": true
  *     }
  *   }
  */
@@ -28,18 +29,23 @@ import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 export interface StrataConfig {
  /** Auto-continue the next plan step after step compaction. */
  autoContinue?: boolean;
+ /** Hide STRATA marker anchors in the TUI transcript (display only). */
+ hideAnchors?: boolean;
 }
 
 export interface StrataSettings {
  autoContinue: boolean;
+ hideAnchors: boolean;
 }
 
 export const STRATA_DEFAULTS: StrataSettings = {
  autoContinue: true,
+ hideAnchors: true,
 };
 
 const ENV = {
  autoContinue: "PI_STRATA_AUTO_CONTINUE",
+ hideAnchors: "PI_STRATA_HIDE_ANCHORS",
 } as const;
 
 type JsonScalar = number | string | boolean | null;
@@ -79,6 +85,9 @@ export function readPiStrataConfig(
   if (typeof s.autoContinue === "boolean") {
    merged.autoContinue = s.autoContinue;
   }
+  if (typeof s.hideAnchors === "boolean") {
+   merged.hideAnchors = s.hideAnchors;
+  }
  }
  return merged;
 }
@@ -86,9 +95,25 @@ export function readPiStrataConfig(
 /** Resolve the effective autoContinue: env > config > default. */
 function resolveAutoContinue(cfgAuto: boolean | undefined): boolean {
  const envAuto = envValue(ENV.autoContinue);
- if (envAuto !== undefined) return envAuto !== "0"; // legacy: only "0" disables
- if (cfgAuto !== undefined) return cfgAuto;
+ if (envAuto !== undefined) {
+  return envAuto !== "0"; // legacy: only "0" disables
+ }
+ if (cfgAuto !== undefined) {
+  return cfgAuto;
+ }
  return STRATA_DEFAULTS.autoContinue;
+}
+
+/** Resolve the effective hideAnchors: env > config > default. */
+function resolveHideAnchors(cfgHide: boolean | undefined): boolean {
+ const envHide = envValue(ENV.hideAnchors);
+ if (envHide !== undefined) {
+  return envHide !== "0"; // only "0" disables
+ }
+ if (cfgHide !== undefined) {
+  return cfgHide;
+ }
+ return STRATA_DEFAULTS.hideAnchors;
 }
 
 /**
@@ -101,5 +126,6 @@ export function resolveStrataSettings(
  const cfg = readPiStrataConfig(cwd, globalSettingsPath);
  return {
   autoContinue: resolveAutoContinue(cfg.autoContinue),
+  hideAnchors: resolveHideAnchors(cfg.hideAnchors),
  };
 }

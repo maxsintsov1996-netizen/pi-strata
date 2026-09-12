@@ -156,6 +156,28 @@ export function buildStrataSummary(layers: StrataLayers): string {
 }
 
 // ---------------------------------------------------------------------------
+// Display: marker anchors hidden in the TUI transcript
+// ---------------------------------------------------------------------------
+
+/**
+ * Strip STRATA marker anchors from Markdown for display: a marker that owns
+ * its line drops the whole line (paragraph spacing is preserved), and an
+ * inline marker drops the token itself. Block bodies are kept — the phase
+ * content stays readable in the transcript. Display-only: fed to pi's
+ * markdown transformer, which renders the result in the TUI while the
+ * session and the model context keep the raw markers. Pure, synchronous,
+ * idempotent.
+ */
+export function stripStrataMarkersForDisplay(md: string): string {
+  return md
+    .replace(
+      /(^|\n)[ \t]*\/\*STRATA::(?:END::)?(?:RESEARCH|PLAN|STEP-\d+)::v1\*\/[ \t]*\n/g,
+      "$1",
+    )
+    .replace(/\/\*STRATA::(?:END::)?(?:RESEARCH|PLAN|STEP-\d+)::v1\*\//g, "");
+}
+
+// ---------------------------------------------------------------------------
 // Plan (TODO) parsing — markdown checkboxes
 // ---------------------------------------------------------------------------
 
@@ -210,11 +232,10 @@ export function reportPlanCounts(
   reports: readonly { n: number }[],
 ): { done: number; total: number } {
   const total = parsePlan(md).length;
-  const completed = new Set(
-    reports
-      .filter((report) => report.n >= 1 && report.n <= total)
-      .map((report) => report.n),
-  );
+  const completed = new Set<number>();
+  for (const report of reports) {
+    if (report.n >= 1 && report.n <= total) completed.add(report.n);
+  }
   return { done: completed.size, total };
 }
 

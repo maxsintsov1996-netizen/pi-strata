@@ -46,6 +46,7 @@ import {
   parsePlan,
   reportPlanCounts,
   strataPaths,
+  stripStrataMarkersForDisplay,
   type StrataLayers,
 } from "./strata.ts";
 
@@ -236,11 +237,24 @@ export default function (pi: ExtensionAPI) {
     pending: null,
   };
   let autoContinue = initial.autoContinue;
+  let hideAnchors = initial.hideAnchors;
   // Set by the session_before_compact handler: did the LAST before-compact
   // event return a strata compaction result? Used by session_compact to
   // detect when another extension's result replaced ours (pi keeps the
   // result of the last-loaded handler — there is no merge).
   let compactOurs = false;
+
+  // Display-only: hide the STRATA marker anchors in the TUI transcript
+  // (config hideAnchors, default on; re-resolved on session_start). pi's
+  // markdown transformer runs before rendering (assistant text and
+  // thinking, streaming and final, new and restored messages); the session
+  // and the model context keep the raw markers, so extraction is
+  // unaffected. User messages are passed through untouched.
+  pi.registerMarkdownTransformer((markdown, { messageType }) =>
+    hideAnchors && messageType !== "user"
+      ? stripStrataMarkersForDisplay(markdown)
+      : markdown,
+  );
 
   const statusText = (ctx: ExtensionContext): string => {
     const dir = rt.strataDir ?? "(no session)";
@@ -270,7 +284,7 @@ export default function (pi: ExtensionAPI) {
       `research: ${layers?.research ? "yes" : "no"}`,
       `plan: ${counts.done}/${counts.total} (${next})`,
       `reports: [${reportNumbers.join(",")}]`,
-      `settings: auto=${autoContinue ? "on" : "off"}`,
+      `settings: auto=${autoContinue ? "on" : "off"} anchors=${hideAnchors ? "hidden" : "shown"}`,
       `pending: ${pending}`,
     ].join(" | ");
   };
@@ -373,6 +387,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     const s = resolveStrataSettings(ctx.cwd);
     autoContinue = s.autoContinue;
+    hideAnchors = s.hideAnchors;
 
     rt.strataDir = resolveStrataDir(ctx);
     rt.pending = null;

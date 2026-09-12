@@ -62,6 +62,14 @@ so the prefix is untouched.
      automatically, and the new cycle starts with a clean step history.
    Each plan item is self-contained: detailed enough to execute the step
    after compaction without re-reading the context.
+   The `/*STRATA::…*/` anchors are not shown in the TUI transcript
+   (display-only: pi's markdown transformer strips them before rendering —
+   in the assistant's text and thinking, including streaming); the phase
+   block bodies stay visible. The session, the model context, and the summary
+   keep the raw markers — extraction is unaffected. Disable with
+   `piStrata.hideAnchors: false` / `PI_STRATA_HIDE_ANCHORS=0` (re-resolved on
+   `session_start`; the current value is visible in `/strata`:
+   `anchors=hidden|shown`).
 4. `session_before_compact` — compaction of a strata session: blocks are
    extracted with a regex from (previous summary + new messages), the last
    block of each type wins, and the summary = the deterministic assembly
@@ -123,7 +131,8 @@ Invalid values at any level are ignored (fall-through to the next level).
 ```json
 {
   "piStrata": {
-    "autoContinue": true
+    "autoContinue": true,
+    "hideAnchors": true
   }
 }
 ```
@@ -133,6 +142,7 @@ Invalid values at any level are ignored (fall-through to the next level).
 | Variable | Config field | Default | Description |
 | --- | --- | --- | --- |
 | `PI_STRATA_AUTO_CONTINUE` | `autoContinue` | on | auto-continue the next step after compaction (`0` — off) |
+| `PI_STRATA_HIDE_ANCHORS` | `hideAnchors` | on | hide STRATA anchors in the TUI transcript (display only; `0` — show them) |
 | `PI_ROOT` | — | global install | path to pi-coding-agent (self-test only) |
 
 The effective settings are visible in `strata(action="status")` / `/strata`

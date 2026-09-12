@@ -257,6 +257,35 @@ const main = async () => {
     assert.equal(strata.extractLayers("## Goal\nrandom summary"), undefined);
   });
 
+  await test("stripStrataMarkersForDisplay: anchors hidden, bodies and prose kept", () => {
+    const md = `Привет! Иду к плану.\n\n${R}\n\nТеперь план:\n\n${PLAN1}\n\ninline /*STRATA::STEP-1::v1*/ body /*STRATA::END::STEP-1::v1*/ after\n\nФинал.`;
+    const out = strata.stripStrataMarkersForDisplay(md);
+    assert.ok(!out.includes("STRATA::"), "no anchors left");
+    for (const kept of [
+      "Привет! Иду к плану.",
+      "stack: node",
+      "constraints: local LLM",
+      "- [ ] write parser",
+      "- [ ] add tests",
+      "body",
+      "Финал.",
+    ]) {
+      assert.ok(out.includes(kept), `kept: ${kept}`);
+    }
+    // idempotent; clean text passes through unchanged
+    assert.equal(strata.stripStrataMarkersForDisplay(out), out);
+    assert.equal(
+      strata.stripStrataMarkersForDisplay("plain\n\n- [ ] item"),
+      "plain\n\n- [ ] item",
+    );
+    // a partially streamed marker token is not a full token yet — untouched
+    assert.ok(
+      strata
+        .stripStrataMarkersForDisplay("x /*STRATA::RESEARC")
+        .includes("/*STRATA::RESEARC"),
+    );
+  });
+
   await test("plan: parse/firstUnchecked/itemText/planCounts", () => {
     const raw =
       "  * [ ] first\n- [X] second\n+ [x] third\nprose line\n- [ ]   spaced  ";
@@ -762,7 +791,7 @@ const main = async () => {
   console.log("config.ts — env > config > default");
 
   const config = await jiti.import(join(here, "config.ts"));
-  const STRATA_ENV = ["PI_STRATA_AUTO_CONTINUE"];
+  const STRATA_ENV = ["PI_STRATA_AUTO_CONTINUE", "PI_STRATA_HIDE_ANCHORS"];
   const savedEnv = Object.fromEntries(
     STRATA_ENV.map((k) => [k, process.env[k]]),
   );
@@ -782,6 +811,7 @@ const main = async () => {
       clearStrataEnv();
       assert.deepEqual(config.resolveStrataSettings(workDir, noSettings), {
         autoContinue: true,
+        hideAnchors: true,
       });
     });
 
@@ -790,6 +820,7 @@ const main = async () => {
       writeSettings(globalSettings, { piStrata: { autoContinue: false } });
       assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
         autoContinue: false,
+        hideAnchors: true,
       });
     });
 
@@ -803,6 +834,7 @@ const main = async () => {
       });
       assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
         autoContinue: true,
+        hideAnchors: true,
       });
     });
 
@@ -810,7 +842,27 @@ const main = async () => {
       process.env.PI_STRATA_AUTO_CONTINUE = "0";
       assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
         autoContinue: false,
+        hideAnchors: true,
       });
+    });
+
+    await test("hideAnchors: config applies, env 0/1 override", () => {
+      clearStrataEnv();
+      writeSettings(globalSettings, { piStrata: { hideAnchors: false } });
+      assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
+        autoContinue: true,
+        hideAnchors: false,
+      });
+      process.env.PI_STRATA_HIDE_ANCHORS = "1";
+      assert.equal(
+        config.resolveStrataSettings(workDir, globalSettings).hideAnchors,
+        true,
+      );
+      process.env.PI_STRATA_HIDE_ANCHORS = "0";
+      assert.equal(
+        config.resolveStrataSettings(workDir, globalSettings).hideAnchors,
+        false,
+      );
     });
 
     await test("invalid values fall through to lower levels", () => {
@@ -818,10 +870,12 @@ const main = async () => {
       writeSettings(globalSettings, {
         piStrata: {
           autoContinue: "yes", // not a boolean -> ignored
+          hideAnchors: "yes", // not a boolean -> ignored
         },
       });
       assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
         autoContinue: true, // invalid config -> default
+        hideAnchors: true, // invalid config -> default
       });
       process.env.PI_STRATA_AUTO_CONTINUE = "1";
       assert.equal(
@@ -836,6 +890,7 @@ const main = async () => {
       writeSettings(projectSettings, { theme: "dark" });
       assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
         autoContinue: true,
+        hideAnchors: true,
       });
     });
   } finally {
@@ -851,6 +906,7 @@ const main = async () => {
   const handlers = {};
   const tools = {};
   const commands = {};
+  const transformers = [];
   const mockPi = {
     on: (name, handler) => {
       handlers[name] ??= [];
@@ -861,6 +917,9 @@ const main = async () => {
     },
     registerCommand: (name, def) => {
       commands[name] = def;
+    },
+    registerMarkdownTransformer: (fn) => {
+      transformers.push(fn);
     },
     sendUserMessage: () => {},
   };
@@ -880,6 +939,7 @@ const main = async () => {
     }
     assert.ok(tools.strata, "missing tool: strata");
     assert.ok(commands.strata, "missing command: /strata");
+    assert.ok(transformers.length >= 1, "missing markdown transformer");
   });
 
   // Mutable branch shared by the tool tests (branchText scans it).
@@ -916,6 +976,94 @@ const main = async () => {
   // establish the session (sets rt.strataDir from the session file path)
   handlers.session_start[0]({ type: "session_start" }, tCtx);
 
+  // Anchor-display tests: pin the effective config (project settings file +
+  // a session_start re-resolve) so the assertions never depend on the
+  // machine's real global settings.
+  writeFileSync(join(workDir, "2026.jsonl"), "");
+  writeSettings(projectSettings, { piStrata: { hideAnchors: true } });
+  handlers.session_start[0]({ type: "session_start" }, tCtx);
+
+  await test("markdown transformer hides STRATA anchors (display-only)", () => {
+    const t = transformers[transformers.length - 1];
+    const ctx = {
+      messageType: "assistant",
+      isStreaming: false,
+      availableWidth: 100,
+    };
+    const md = `Привет!\n\n${R}\n\n${PLAN1}`;
+    const out = t(md, ctx);
+    assert.ok(!out.includes("STRATA::"), "anchors hidden in assistant text");
+    assert.ok(out.includes("stack: node"), "research body kept");
+    assert.ok(out.includes("- [ ] write parser"), "plan body kept");
+    // thinking blocks are transformed like assistant text (incl. streaming)
+    assert.ok(
+      !t(R, {
+        messageType: "assistant-thinking",
+        isStreaming: true,
+        availableWidth: 100,
+      }).includes("STRATA::"),
+    );
+    // user messages are untouched
+    assert.equal(
+      t(md, { messageType: "user", isStreaming: false, availableWidth: 100 }),
+      md,
+    );
+    // idempotent on re-render (terminal resize re-runs the chain)
+    assert.equal(t(out, ctx), out);
+  });
+
+  await test("hideAnchors: config toggle re-resolved on session_start", async () => {
+    const t = transformers[transformers.length - 1];
+    const ctx = {
+      messageType: "assistant",
+      isStreaming: false,
+      availableWidth: 100,
+    };
+    const md = `x\n\n${R}`;
+    const statusText = async () => {
+      const r = await tools.strata.execute(
+        "s-anchor",
+        { action: "status" },
+        undefined,
+        undefined,
+        tCtx,
+      );
+      return r.content[0].text;
+    };
+    const savedEnv = process.env.PI_STRATA_HIDE_ANCHORS;
+    try {
+      // project config: show the anchors
+      delete process.env.PI_STRATA_HIDE_ANCHORS;
+      writeSettings(projectSettings, { piStrata: { hideAnchors: false } });
+      handlers.session_start[0]({ type: "session_start" }, tCtx);
+      assert.ok(t(md, ctx).includes("STRATA::"), "hideAnchors=false shows");
+      assert.ok((await statusText()).includes("anchors=shown"));
+
+      // project config: hide the anchors again
+      writeSettings(projectSettings, { piStrata: { hideAnchors: true } });
+      handlers.session_start[0]({ type: "session_start" }, tCtx);
+      assert.ok(!t(md, ctx).includes("STRATA::"), "hideAnchors=true hides");
+      assert.ok((await statusText()).includes("anchors=hidden"));
+
+      // env "0" overrides config true
+      process.env.PI_STRATA_HIDE_ANCHORS = "0";
+      handlers.session_start[0]({ type: "session_start" }, tCtx);
+      assert.ok(t(md, ctx).includes("STRATA::"), "env 0 shows");
+
+      // env "1" overrides config false
+      writeSettings(projectSettings, { piStrata: { hideAnchors: false } });
+      process.env.PI_STRATA_HIDE_ANCHORS = "1";
+      handlers.session_start[0]({ type: "session_start" }, tCtx);
+      assert.ok(!t(md, ctx).includes("STRATA::"), "env 1 hides");
+    } finally {
+      if (savedEnv === undefined) delete process.env.PI_STRATA_HIDE_ANCHORS;
+      else process.env.PI_STRATA_HIDE_ANCHORS = savedEnv;
+      // leave the session in the default hidden state for later tests
+      writeSettings(projectSettings, { piStrata: { hideAnchors: true } });
+      handlers.session_start[0]({ type: "session_start" }, tCtx);
+    }
+  });
+
   await test("reload: compaction rehydrates session state without session_start", async () => {
     const reloadedHandlers = {};
     factory({
@@ -925,6 +1073,7 @@ const main = async () => {
       },
       registerTool: () => {},
       registerCommand: () => {},
+      registerMarkdownTransformer: () => {},
       sendUserMessage: () => {},
     });
     const res = await reloadedHandlers.session_before_compact[0](
