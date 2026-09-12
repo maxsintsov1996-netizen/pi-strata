@@ -309,25 +309,6 @@ const main = async () => {
     assert.equal(strata.firstUnreportedPlanStep(raw, [{ n: 1 }, { n: 3 }]), 1);
   });
 
-  await test("firstSentence: first sentence only, fallback to full text", () => {
-    assert.equal(
-      strata.firstSentence("write parser. Then fold layers and emit a summary"),
-      "write parser.",
-    );
-    assert.equal(
-      strata.firstSentence("run npm test! then deploy? maybe"),
-      "run npm test!",
-    );
-    assert.equal(
-      strata.firstSentence("single line without punctuation"),
-      "single line without punctuation",
-    );
-    assert.equal(
-      strata.firstSentence("  spaced out.  second  "),
-      "spaced out.",
-    );
-  });
-
   const workDir = mkdtempSync(join(tmpdir(), "pi-strata-test-"));
   const sDir = join(workDir, "session.pi_strata");
 
@@ -865,6 +846,17 @@ const main = async () => {
       );
     });
 
+    await test("legacy enabled in config is ignored (session state now)", () => {
+      clearStrataEnv();
+      writeSettings(globalSettings, { piStrata: { enabled: false } });
+      // `enabled` is no longer a config field — it must not leak into the
+      // resolved settings at all (the mode is per-session, off by default)
+      assert.deepEqual(config.resolveStrataSettings(workDir, globalSettings), {
+        autoContinue: true,
+        hideAnchors: true,
+      });
+    });
+
     await test("invalid values fall through to lower levels", () => {
       clearStrataEnv();
       writeSettings(globalSettings, {
@@ -939,6 +931,7 @@ const main = async () => {
     }
     assert.ok(tools.strata, "missing tool: strata");
     assert.ok(commands.strata, "missing command: /strata");
+    assert.ok(commands["strata-on"], "missing command: /strata-on");
     assert.ok(transformers.length >= 1, "missing markdown transformer");
   });
 
@@ -1066,16 +1059,21 @@ const main = async () => {
 
   await test("reload: compaction rehydrates session state without session_start", async () => {
     const reloadedHandlers = {};
+    const reloadedCommands = {};
     factory({
       on: (name, handler) => {
         reloadedHandlers[name] ??= [];
         reloadedHandlers[name].push(handler);
       },
       registerTool: () => {},
-      registerCommand: () => {},
+      registerCommand: (name, def) => {
+        reloadedCommands[name] = def;
+      },
       registerMarkdownTransformer: () => {},
       sendUserMessage: () => {},
     });
+    // a /reload starts a fresh runtime: the mode is off again — opt in
+    await reloadedCommands["strata-on"].handler("", tCtx);
     const res = await reloadedHandlers.session_before_compact[0](
       makeEvent({ messages: [assistantMsg(`${R}\n${PLAN1}`)] }),
       tCtx,
@@ -1084,7 +1082,9 @@ const main = async () => {
     assert.equal(res.compaction.details.strata.mode, "plain");
   });
 
-  await test("before_agent_start injects static instructions (layer 0)", () => {
+  await test("before_agent_start injects static instructions (layer 0)", async () => {
+    // the session started off (default): opt in for this test
+    await commands["strata-on"].handler("", tCtx);
     const res = handlers.before_agent_start[0]({
       type: "before_agent_start",
       prompt: "hi",
@@ -1110,6 +1110,128 @@ const main = async () => {
   });
 
   const exec = tools.strata.execute;
+
+  await test("mode: off by default; /strata-on enables it for the session only", async () => {
+    const notifs = [];
+    const widgets = {};
+    const cmdCtx = {
+      ...tCtx,
+      hasUI: true,
+      ui: {
+        notify: (msg, level) => notifs.push([msg, level]),
+        setWidget: (key, content, opts) => {
+          widgets[key] = [content, opts];
+        },
+        confirm: async () => true,
+      },
+    };
+    // fresh session: the mode is off by default (no settings/env involved)
+    handlers.session_start[0]({ type: "session_start" }, cmdCtx);
+    assert.ok(widgets["strata-mode"][0].includes("strata: off"));
+    assert.equal(widgets["strata-mode"][1].placement, "belowEditor");
+
+    // no layer-0 instructions
+    assert.equal(
+      handlers.before_agent_start[0]({
+        type: "before_agent_start",
+        prompt: "hi",
+        systemPrompt: "BASE",
+        systemPromptOptions: {},
+      }),
+      undefined,
+    );
+
+    // pi's default compaction (no strata summary)
+    const res = await handlers.session_before_compact[0](
+      makeEvent({ messages: [assistantMsg(`${R}\n${PLAN1}`)] }),
+      cmdCtx,
+    );
+    assert.equal(res, undefined);
+
+    // advance is refused
+    const e = await exec(
+      "dis-1",
+      { action: "advance" },
+      undefined,
+      undefined,
+      cmdCtx,
+    );
+    assert.ok(e.isError);
+    assert.ok(e.content[0].text.includes("disabled"));
+    assert.ok(e.content[0].text.includes("/strata-on"));
+
+    // status reports the mode
+    const s = await exec(
+      "dis-2",
+      { action: "status" },
+      undefined,
+      undefined,
+      cmdCtx,
+    );
+    assert.ok(s.content[0].text.includes("enabled: off"));
+
+    // /strata-on: session-scoped enable, no settings file is written
+    const settingsBefore = readFileSync(projectSettings, "utf8");
+    await commands["strata-on"].handler("", cmdCtx);
+    assert.equal(
+      readFileSync(projectSettings, "utf8"),
+      settingsBefore,
+      "no settings file written",
+    );
+    assert.ok(widgets["strata-mode"][0].includes("strata: on"));
+    assert.ok(notifs.some(([m, l]) => l === "info" && m.includes("enabled")));
+
+    // strata compaction and instructions come back
+    const res2 = await handlers.session_before_compact[0](
+      makeEvent({ messages: [assistantMsg(`${R}\n${PLAN1}`)] }),
+      cmdCtx,
+    );
+    assert.ok(res2?.compaction, "strata compaction back when enabled");
+    assert.ok(
+      handlers.before_agent_start[0]({
+        type: "before_agent_start",
+        prompt: "hi",
+        systemPrompt: "BASE",
+        systemPromptOptions: {},
+      }).systemPrompt.includes("PI-STRATA"),
+    );
+    const s2 = await exec(
+      "dis-3",
+      { action: "status" },
+      undefined,
+      undefined,
+      cmdCtx,
+    );
+    assert.ok(s2.content[0].text.includes("enabled: on"));
+
+    // a new session starts off again (the mode is not persisted)
+    handlers.session_start[0]({ type: "session_start" }, cmdCtx);
+    assert.ok(widgets["strata-mode"][0].includes("strata: off"));
+  });
+
+  await test("strata-on: idempotent when already on", async () => {
+    const notifs = [];
+    const cmdCtx = {
+      ...tCtx,
+      hasUI: true,
+      ui: {
+        notify: (msg) => notifs.push(msg),
+        setWidget: () => {},
+        confirm: async () => true,
+      },
+    };
+    await commands["strata-on"].handler("", cmdCtx);
+    await commands["strata-on"].handler("", cmdCtx);
+    assert.ok(notifs.some((m) => m.includes("already on")));
+    const s = await exec(
+      "dis-4",
+      { action: "status" },
+      undefined,
+      undefined,
+      cmdCtx,
+    );
+    assert.ok(s.content[0].text.includes("enabled: on"));
+  });
 
   await test("advance: validation errors (no blocks / no plan / step without report / unchecked item)", async () => {
     branch.length = 0;
@@ -1209,6 +1331,7 @@ implemented parser; files: src/parser.ts; tests green
     );
     assert.ok(!r.isError);
     assert.ok(r.content[0].text.includes("research: yes"));
+    assert.ok(r.content[0].text.includes("enabled: on"));
     assert.ok(r.content[0].text.includes("plan: 1/2"));
     assert.ok(r.content[0].text.includes("reports: [1]"));
   });
@@ -1296,26 +1419,31 @@ implemented parser; files: src/parser.ts; tests green
         setWidget: (key, lines) => widgets.push([key, lines]),
       },
     };
+    const lastSet = (key) => {
+      for (let i = widgets.length - 1; i >= 0; i--)
+        if (widgets[i][0] === key) return widgets[i];
+      return null;
+    };
     handlers.turn_end[0]({ type: "turn_end" }, ctx);
-    assert.deepEqual(widgets[widgets.length - 1], [
+    assert.deepEqual(lastSet("strata"), [
       "strata",
       ["strata ▸ 1/2 ✓▶  next: #2 add tests"],
     ]);
-    // non-strata branch: the widget is hidden again
+    // the mode indicator is redundant while the dashboard is visible
+    assert.deepEqual(lastSet("strata-mode"), ["strata-mode", undefined]);
+    // non-strata branch: dashboard hidden, mode indicator back
     branch.length = 0;
     branch.push(branchMsg("hello", "w3"));
     handlers.turn_end[0]({ type: "turn_end" }, ctx);
-    assert.equal(widgets[widgets.length - 1][1], undefined);
+    assert.equal(lastSet("strata")[1], undefined);
+    assert.deepEqual(lastSet("strata-mode"), ["strata-mode", ["strata: on"]]);
   });
 
-  await test("turn_end widget: next step shows the first sentence only", async () => {
+  await test("turn_end widget: next label is the item part before the first colon", async () => {
     branch.length = 0;
     branch.push(
       branchMsg(
-        `Plan:\n${PLAN1.replace(
-          "- [ ] write parser",
-          "- [ ] write parser. Then fold layers and emit a byte-stable summary",
-        )}`,
+        `Plan:\n/*STRATA::PLAN::v1*/\n- [ ] Step 1 (Makefile): add build and test targets to the Makefile\n- [ ] ship\n/*STRATA::END::PLAN::v1*/`,
         "w4",
       ),
     );
@@ -1329,15 +1457,19 @@ implemented parser; files: src/parser.ts; tests green
       },
     };
     handlers.turn_end[0]({ type: "turn_end" }, ctx);
-    assert.deepEqual(widgets[widgets.length - 1], [
+    // the first set of the turn is the dashboard (the mode widget is
+    // cleared behind it — redundant while the dashboard is visible)
+    assert.deepEqual(widgets[0], [
       "strata",
-      ["strata ▸ 0/2 ▶·  next: #1 write parser."],
+      ["strata ▸ 0/2 ▶·  next: #1 Step 1 (Makefile)"],
     ]);
   });
 
-  await test("turn_end widget: long unpunctuated item is truncated at 56", async () => {
+  await test("turn_end widget: colon-less next label is truncated at 56", async () => {
+    // no colon in the item: the full text is the label (the colon is
+    // replaced by a comma on purpose — a colon would cut it first)
     const long =
-      "update the blocksToLayers test in check.cjs: the report before the new PLAN is now dropped";
+      "update the blocksToLayers test in check.cjs, the report before the new PLAN is now dropped";
     branch.length = 0;
     branch.push(
       branchMsg(
@@ -1355,7 +1487,7 @@ implemented parser; files: src/parser.ts; tests green
       },
     };
     handlers.turn_end[0]({ type: "turn_end" }, ctx);
-    assert.deepEqual(widgets[widgets.length - 1], [
+    assert.deepEqual(widgets[0], [
       "strata",
       [`strata ▸ 0/1 ▶  next: #1 ${long.slice(0, 55)}…`],
     ]);

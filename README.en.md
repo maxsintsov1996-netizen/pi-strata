@@ -96,6 +96,21 @@ so the prefix is untouched.
    manually): the orphaned `*.pi_strata` directory is cleaned up
    automatically at the start of the next session (pi has no "session
    deleted" event, so the cleanup is lazy, in `session_start`).
+7. The strata mode is **per-session state, not a setting**: it is **off by
+   default** and is enabled for the current session with `/strata-on`. Nothing
+   is written to files: a new session (re)start (or `/reload`) begins with the
+   mode off again; there is deliberately no in-session off command — off is
+   the session default. While enabled, the layer-0 instructions are appended
+   to the system prompt and compaction is intercepted (`session_before_compact`);
+   while disabled, the instructions are not added, compaction falls back to
+   pi's default, pending phase requests are dropped, and the plan widget is
+   hidden. While the plan dashboard is not visible (no strata blocks in the
+   session yet), the `strata: on|off` mode widget is shown at the bottom of
+   the screen (pi-lens style); once the dashboard is up, the mode widget is
+   hidden — the dashboard already shows the strata state. A resumed/forked strata session starts
+   off, but at session start a notice is shown: layers were found in the
+   conversation, and `/strata-on` restores the pipeline. Enabling is safe:
+   the layers live in the conversation and are re-extracted from the branch.
 
 ## Installation
 
@@ -114,7 +129,10 @@ compiled by jiti in the pi runtime — no build step.
   blocks against the branch: for the plan — a PLAN block must exist, for a
   step — a STEP-N block; PLAN remains immutable;
 - `/strata` — layer status; `/strata compact` — forced compaction;
-  `/strata reset` — clear the session directory (`tmp/`).
+  `/strata reset` — clear the session directory (`tmp/`);
+- `/strata-on` — enable the strata mode for the current session (off by
+  default; per-session state, nothing is written to files; see "How it
+  works", item 7).
 
 ## Configuration
 
@@ -137,6 +155,11 @@ Invalid values at any level are ignored (fall-through to the next level).
 }
 ```
 
+The on/off mode is **not a setting**: it is per-session state (off by
+default; `/strata-on` enables it for the session — see "How it works",
+item 7). A legacy `piStrata.enabled` field in settings.json and
+`PI_STRATA_ENABLED` are no longer read.
+
 ### Environment variables (override the config)
 
 | Variable | Config field | Default | Description |
@@ -151,13 +174,13 @@ The effective settings are visible in `strata(action="status")` / `/strata`
 ## Structure
 
 ```text
-index.ts      — event registration, strata tool, /strata command
+index.ts      — event registration, strata tool, /strata and /strata-on commands
 compaction.ts — session_before_compact: plan/step/plain modes
                 (plain = strata sections + pi's standard LLM summary)
 strata.ts     — pure logic: markers, extraction, latest-wins + cycle
                 boundary (a new RESEARCH/PLAN resets the reports), summary
                 (byte-stable), round-trip, plan parsing, snapshots
-check.cjs     — self-test (48 tests)
+check.cjs     — self-test (57 tests)
 ```
 
 ## Verification

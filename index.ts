@@ -40,7 +40,6 @@ import {
   SEP,
   cleanupOrphanedStrataDirs,
   extractLayers,
-  firstSentence,
   firstUnreportedPlanStep,
   itemText,
   parsePlan,
@@ -236,6 +235,11 @@ export default function (pi: ExtensionAPI) {
     strataDir: null,
     pending: null,
   };
+  // The strata mode is SESSION state, not a setting: off by default, enabled
+  // for the session with /strata-on. It is not persisted anywhere — a session
+  // (re)start or /reload begins with it off again. There is deliberately no
+  // in-session off command: off is the session default.
+  let enabled = false;
   let autoContinue = initial.autoContinue;
   let hideAnchors = initial.hideAnchors;
   // Set by the session_before_compact handler: did the LAST before-compact
@@ -281,6 +285,7 @@ export default function (pi: ExtensionAPI) {
           : rt.pending.kind;
     return [
       `dir: ${dir}`,
+      `enabled: ${enabled ? "on" : "off"}`,
       `research: ${layers?.research ? "yes" : "no"}`,
       `plan: ${counts.done}/${counts.total} (${next})`,
       `reports: [${reportNumbers.join(",")}]`,
@@ -289,11 +294,15 @@ export default function (pi: ExtensionAPI) {
     ].join(" | ");
   };
 
-  // Concise widget label: the item's first sentence, capped for the
-  // one-line UI (plan items are often one long sentence).
+  // Concise widget label: the part of the item before the first colon —
+  // plan items are usually written as "Step N (target): details", and only
+  // the title belongs on the one-line UI. Items without a colon fall back
+  // to the full text, capped at 56 chars.
   const nextLabel = (md: string, idx: number): string => {
-    const t = firstSentence(itemText(md, idx) ?? "");
-    return t.length > 56 ? `${t.slice(0, 55)}…` : t;
+    const t = (itemText(md, idx) ?? "").trim();
+    const cut = t.indexOf(":");
+    const label = cut > 0 ? t.slice(0, cut).trim() : t;
+    return label.length > 56 ? `${label.slice(0, 55)}…` : label;
   };
 
   // Persistent plan-execution dashboard (widget above the editor).
@@ -326,8 +335,24 @@ export default function (pi: ExtensionAPI) {
     return [`strata ▸ ${done}/${total} ${bar}  ${next}`];
   };
 
+  // Keeps both strata widgets in sync (call this whenever the conversation
+  // or the mode can have changed).
   const updateWidget = (ctx: ExtensionContext): void => {
-    if (ctx.hasUI) ctx.ui.setWidget("strata", planWidgetLines(ctx));
+    if (!ctx.hasUI) return;
+    // The plan dashboard (above the editor) is a strata-session feature:
+    // hidden while the mode is off (and for non-strata sessions, as before).
+    const lines = enabled ? planWidgetLines(ctx) : undefined;
+    ctx.ui.setWidget("strata", lines);
+    // Mode indicator (below the editor, pi-lens style): redundant while the
+    // dashboard is visible — it already shows the strata state. Shown only
+    // while the dashboard is hidden, so the session default (off) or an
+    // explicit /strata-on is never a surprise.
+    const modeLabel = `strata: ${enabled ? "on" : "off"}`;
+    ctx.ui.setWidget(
+      "strata-mode",
+      lines === undefined ? [modeLabel] : undefined,
+      { placement: "belowEditor" },
+    );
   };
 
   const autoContinueNext = (ctx: ExtensionContext): void => {
@@ -386,6 +411,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", (_event, ctx) => {
     const s = resolveStrataSettings(ctx.cwd);
+    // The mode is session state: every (re)started session begins off; the
+    // user opts in with /strata-on (nothing is persisted).
+    enabled = false;
     autoContinue = s.autoContinue;
     hideAnchors = s.hideAnchors;
 
@@ -406,11 +434,16 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    // Re-announce the layer state extracted from the conversation
-    // (fork/clone friendly: there are no files to rehydrate anymore).
+    // Off is the normal session default: stay silent unless the session
+    // already carries strata layers (a resumed/forked strata session — there
+    // are no files to rehydrate, the layers live in the conversation) — then
+    // point at /strata-on and announce the layer state.
     const layers = extractLayers(branchText(ctx));
-    if (layers && (layers.research || layers.plan) && ctx.hasUI) {
-      ctx.ui.notify(`pi-strata: ${statusText(ctx)}`, "info");
+    if (ctx.hasUI && layers && (layers.research || layers.plan)) {
+      ctx.ui.notify(
+        `pi-strata: strata layers found in the session, mode is off (session default) — /strata-on re-enables the pipeline. ${statusText(ctx)}`,
+        "info",
+      );
     }
     updateWidget(ctx);
   });
@@ -421,6 +454,7 @@ export default function (pi: ExtensionAPI) {
     // session-scoped value lazily so the next turn still receives strata
     // instructions and can intercept compaction.
     if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
+    if (!enabled) return; // disabled: no layer-0 instructions this turn
     const instructions = buildStrataInstructions(rt.strataDir);
     return { systemPrompt: `${event.systemPrompt}\n\n${instructions}` };
   });
@@ -429,6 +463,12 @@ export default function (pi: ExtensionAPI) {
     // Compaction can also be the first event after `/reload` (for example an
     // automatic overflow compaction), before another agent turn has started.
     if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
+    if (!enabled) {
+      // Disabled: fall back to pi's default compaction. Drop any stale
+      // phase request so it cannot be consumed by a later compaction.
+      rt.pending = null;
+      return;
+    }
     const result = await handleSessionBeforeCompact(event, ctx, rt);
     compactOurs = result?.compaction !== undefined;
     return result;
@@ -438,6 +478,11 @@ export default function (pi: ExtensionAPI) {
     if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
     const pending = rt.pending;
     if (!pending) return;
+    if (!enabled) {
+      // Disabled mid-phase: drop the request, no strata compaction.
+      rt.pending = null;
+      return;
+    }
     // Do not consume `pending` here. `ctx.compact()` starts asynchronously and
     // `session_before_compact` needs this marker to build a plan/step summary
     // (and to save the correct raw snapshot). It consumes the marker only
@@ -504,6 +549,11 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       switch (params.action) {
         case "advance":
+          if (!enabled)
+            return toolText(
+              "Error: pi-strata is disabled. Run /strata-on to enable it for this session, then call advance again.",
+              true,
+            );
           return actAdvance(rt, ctx, params.step);
         case "status":
           return toolText(statusText(ctx));
@@ -517,7 +567,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("strata", {
     description:
-      "pi-strata: layer status; /strata compact — forced compaction; /strata reset — delete raw snapshots (tmp/)",
+      "pi-strata: layer status; /strata compact — forced compaction; /strata reset — delete raw snapshots (tmp/); /strata-on — enable the mode for this session",
     handler: async (args, ctx) => {
       const cmd = (args ?? "").trim().toLowerCase();
 
@@ -548,6 +598,39 @@ export default function (pi: ExtensionAPI) {
       if (!ok) return;
       rmSync(strataPaths(rt.strataDir).tmp, { recursive: true, force: true });
       ctx.ui.notify("pi-strata: snapshots cleared", "info");
+    },
+  });
+
+  // /strata-on — enable the strata mode for THIS session only. Session-
+  // scoped by design: off by default, nothing is persisted (a session
+  // (re)start or /reload begins off again). Once on: the layer-0 instructions
+  // are appended to the system prompt and strata compaction is intercepted.
+  // There is deliberately no in-session off command — off is the default.
+  pi.registerCommand("strata-on", {
+    description:
+      "pi-strata: enable layered-context mode for this session (off by default; not persisted)",
+    // async: pi's command handler type is Promise<void> even though the
+    // work below is synchronous.
+    handler: async (_args, ctx) => {
+      if (enabled) {
+        if (ctx.hasUI) ctx.ui.notify("pi-strata: already on", "info");
+        return;
+      }
+      enabled = true;
+      rt.pending = null; // a stale phase request must not outlive the switch
+      updateWidget(ctx);
+      if (!ctx.hasUI) return;
+      const layers = extractLayers(branchText(ctx));
+      if (layers && (layers.research || layers.plan)) {
+        // Session already carries strata layers (resumed/forked): re-announce
+        // the current state instead of a generic notice.
+        ctx.ui.notify(`pi-strata: ${statusText(ctx)}`, "info");
+      } else {
+        ctx.ui.notify(
+          "pi-strata: enabled — layer-0 instructions and strata compaction are on for this session",
+          "info",
+        );
+      }
     },
   });
 }

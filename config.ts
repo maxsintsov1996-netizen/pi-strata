@@ -8,6 +8,11 @@
  * Priority (per field): environment (PI_STRATA_*) > config > default.
  * Invalid values at any level are ignored (fall through to the next level).
  *
+ * NOTE: the extension on/off mode is NOT a setting — it is per-session
+ * state: off by default, enabled for the session with /strata-on (see
+ * index.ts). A legacy `piStrata.enabled` field or PI_STRATA_ENABLED in a
+ * settings file is ignored.
+ *
  * Example (.pi/settings.json):
  *   {
  *     "piStrata": {

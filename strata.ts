@@ -209,18 +209,6 @@ export function itemText(md: string, index: number): string | undefined {
   return parsePlan(md)[index]?.text;
 }
 
-/**
- * First sentence of a text: up to the first of [.!?] that is followed by a
- * whitespace character or end of text (a period inside "2.0" or "e.g.0"
- * doesn't count). Falls back to the whole text when no boundary is found.
- * Whitespace runs are collapsed to single spaces.
- */
-export function firstSentence(text: string): string {
-  const t = text.trim().replace(/\s+/g, " ");
-  const m = t.match(/^(.+?[.!?])(?:\s|$)/);
-  return m ? m[1] : t;
-}
-
 export function planCounts(md: string): { done: number; total: number } {
   const items = parsePlan(md);
   return { done: items.filter((t) => t.done).length, total: items.length };
