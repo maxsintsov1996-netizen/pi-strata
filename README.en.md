@@ -1,130 +1,64 @@
+<p align="center"><img src="./pi-strata.png" alt="pi-strata" width="180"></p>
+
 # pi-strata
 
 An extension for [pi-coding-agent](https://github.com/badlogic/pi-mono) that
-maximizes KV-cache / prompt-cache reuse for local LLMs (llama.cpp / Ollama)
+maximizes KV-cache (prompt-caching) reuse for local LLMs (llama.cpp / Ollama)
 via an **immutable, layer-grown context**.
 
 Specification: [`SPEC.md`](./SPEC.md). (Russian: [`README.md`](./README.md).)
 
 ## Idea
 
-The agent prompt is divided into layers whose prefix is **byte-stable**
-across steps:
+The prompt is divided into layers whose prefix is **byte-stable** across
+steps:
 
 ```text
 [Layer 0] system prompt + static pi-strata instructions
-  [Layer 1] /*STRATA::RESEARCH::v1*/ — research report (task, stack, constraints)
-    [Layer 2] /*STRATA::PLAN::v1*/   — plan (TODO list, checkboxes)
+  [Layer 1] /*STRATA::RESEARCH::v1*/ — research report
+    [Layer 2] /*STRATA::PLAN::v1*/   — plan (TODO list)
       [Layer 3] /*STRATA::STEP-N::v1*/ — step reports (append-only)
-        [current] ephemeral work (command output, logs) — discarded into a report
+        [current] ephemeral work — discarded into reports
 ```
 
 Layer data is **not stored in files**: the model writes each phase between
-unique markers directly in its reply text, and the extension extracts the
-blocks algorithmically (regex, the last block of each type wins). A new
-RESEARCH or PLAN block starts a new task cycle: every STEP-N that stood
-before it in the conversation (the previous task's reports) is dropped — a
-new task does not inherit the old plan's step history. The post-compaction
-summary = a marker line + the extracted blocks in a fixed
-order (strictly joined with `\n\n`) — since the summary itself consists of
-marked blocks, the next compaction extracts the layers from (summary + new
-messages) with the same regex — the identical prefix is restored without any
-files (round-trip).
-
-Nothing inside the prefix is inserted or edited "on the fly": the allowed
-mutations are only (a) a new STEP-N block (end of L3), (b) a new PLAN block
-(updated checkbox — the latest version wins), (c) a new RESEARCH/PLAN — a
-new task: all STEP-N blocks standing before it are dropped. The stable
-prefix is
-[system prompt + layer blocks]; on overflow compaction a standard pi LLM
-summary follows the blocks (see "How it works", item 4) — after the blocks,
-so the prefix is untouched.
+unique markers in its reply, and the extension extracts the blocks (regex,
+the last block of each type wins). A new RESEARCH or PLAN starts a new task
+cycle — the previous task's STEP-N reports are dropped. The post-compaction
+summary is a deterministic assembly of the extracted blocks, so the identical
+prefix is restored without any files (round-trip).
 
 ## How it works
 
-1. `session_start` — the session strata directory is created next to the
-   session file: `<dir>/<session-name>.pi_strata/` — only for disposable
-   snapshots in `tmp/` (the files **never** land in the project).
-2. `before_agent_start` — the static pipeline instructions (Layer 0) are
-   appended to the system prompt: the marker protocol, the order of actions,
-   and the self-contained plan-item requirements.
-3. The agent works according to the marker protocol:
-   - after the research it writes a `/*STRATA::RESEARCH::v1*/` block (stack,
-     architecture, inputs, constraints, acceptance criteria);
-   - then a `/*STRATA::PLAN::v1*/` block (TODO list, format `- task`);
-   - it calls `strata(action="advance")`; the first compaction happens at the
-     end of the turn.
-   - after each step: only a `/*STRATA::STEP-N::v1*/` block with a compact
-     report → `strata(action="advance", step=N)` → compaction. PLAN stays as
-     written; each completed step is recorded in its STEP-N report.
-   - a new task (after a plan is complete): the cycle restarts — a fresh
-     RESEARCH and a new PLAN; the previous task's STEP-N reports are dropped
-     automatically, and the new cycle starts with a clean step history.
-   Each plan item is self-contained: detailed enough to execute the step
-   after compaction without re-reading the context.
-   The `/*STRATA::…*/` anchors are not shown in the TUI transcript
-   (display-only: pi's markdown transformer strips them before rendering —
-   in the assistant's text and thinking, including streaming); the phase
-   block bodies stay visible. The session, the model context, and the summary
-   keep the raw markers — extraction is unaffected. Disable with
-   `piStrata.hideAnchors: false` / `PI_STRATA_HIDE_ANCHORS=0` (re-resolved on
-   `session_start`; the current value is visible in `/strata`:
-   `anchors=hidden|shown`).
-4. `session_before_compact` — compaction of a strata session: blocks are
-   extracted with a regex from (previous summary + new messages), the last
-   block of each type wins, and the summary = the deterministic assembly
-   (the `custom summary` result). Before a completed step's compaction the
-   ephemeral context is saved in `tmp/` (`step_N_raw.md`).
-   Any other compaction (overflow, manual) keeps the strata sections and runs
-   pi's standard summarization on top of them: summary = layer blocks + the
-   LLM summary of the ephemeral span (the same prompts and merge semantics as
-   pi without the extension). The LLM never receives the blocks themselves
-   (the merge input is only its own previous tail, and the prompt tells it not
-   to restate the STRATA blocks it sees in the raw conversation), so the
-   stable prefix never passes through the model. If no model/auth is
-   available or the LLM call fails — fallback to the plain layer dump; the
-   in-flight work within `compaction.keepRecentTokens` still stays in the tail.
-   Conflicts with other extensions: if another extension also handles
-   `session_before_compact`, pi uses the result of the last-loaded handler
-   (there is no merge). Strata marks its own result (`details.strata`) and
-   verifies after compaction that it was the one saved: if a foreign handler
-   replaced it, a warning is shown with the cause and the advice to keep a
-   single compaction handler (or load pi-strata last).
-5. After the next step's compaction — auto-continuation (disabled with
-   `PI_STRATA_AUTO_CONTINUE=0`).
-6. A session was deleted (the `.jsonl` is gone — via pi's session picker or
-   manually): the orphaned `*.pi_strata` directory is cleaned up
-   automatically at the start of the next session (pi has no "session
-   deleted" event, so the cleanup is lazy, in `session_start`).
-7. The strata mode is **per-session state, not a setting**: it is **off by
-   default** and is enabled for the current session with `/strata-on`. Nothing
-   is written to files: a new session (re)start (or `/reload`) begins with the
-   mode off again; there is deliberately no in-session off command — off is
-   the session default. While enabled, compaction is intercepted
-   (`session_before_compact`) and the model receives the layer-0 instructions
-   — in a KV-cache-friendly way: in a session that already carries context
-   they are appended as a standing message at the end of the conversation
-   (rendered as a compact expandable line in the TUI), and the system prompt
-   is updated only after the next compaction (a mid-session system-prompt
-   change would make the local model re-read the whole context, while a
-   compaction rewrites it anyway — that is where the instructions move into
-   the system prompt). In a fresh session (no context yet) the instructions
-   go into the system prompt immediately. The state is visible in
-   `strata(status)`: `sysprompt: deferred|active`. While disabled, the
-   instructions are not added, compaction falls back to pi's default, pending
-   phase requests are dropped, and the plan widget is hidden. The widgets are rendered in the pi-lens style (a component factory
-   with the TUI theme: accent — the `strata` brand, dim — secondary info,
-   colored status): the dashboard above the editor —
-   `strata  2/5 ✓✓▶··  next: #3 <title>` (✓ — success, ▶ — accent,
-   · — dim; the title is the plan item's part before the first colon), the
-   mode widget at the bottom — `strata  on|off`; the line is fitted to the
-   terminal width without wrapping. The mode widget is shown only while the
-   dashboard is not visible (no strata blocks in the session yet); once the
-   dashboard is up, the mode widget is hidden — the dashboard already shows
-   the strata state. A resumed/forked strata session starts
-   off, but at session start a notice is shown: layers were found in the
-   conversation, and `/strata-on` restores the pipeline. Enabling is safe:
-   the layers live in the conversation and are re-extracted from the branch.
+1. The mode is **per-session state, not a setting**: off by default, enabled
+   for the current session with `/strata-on` (nothing is written to files;
+   there is no off command — off is the default).
+2. On enable, the Layer 0 instructions are added to the system prompt — with
+   a KV-cache guard: in a session that already carries context they are
+   first delivered as a standing message at the end of the conversation and
+   move into the system prompt only after the next compaction (a mid-session
+   prompt change would make the model re-read the whole context).
+3. The agent follows the marker protocol: RESEARCH → PLAN →
+   `strata(action="advance")` → compaction at the end of the turn; after
+   each step — a STEP-N block with a report → `strata(action="advance",
+   step=N)` → compaction. The plan stays immutable, progress is recorded in
+   reports only; every plan item is self-contained for execution after
+   compaction.
+4. Strata-session compaction: the strata sections are assembled
+   deterministically from the markers; any other compaction (overflow /
+   manual) — layer blocks + pi's standard LLM summarization of the ephemeral
+   span on top of them (the model never receives the blocks themselves, so
+   the stable prefix never passes through the model). When no model is
+   available — fallback to the plain layer dump.
+5. After a step compaction — auto-continuation of the next step (can be
+   disabled). Raw context of completed steps goes to
+   `<session>.pi_strata/tmp/` (outside the project); orphaned directories of
+   deleted sessions are cleaned up at the next session's `session_start`.
+6. TUI: a dashboard above the editor (`strata  2/5 ✓✓▶··  next: #3 …`) and a
+   mode indicator; the `/*STRATA::…*/` anchors are hidden in the transcript
+   (display-only, configurable) while block bodies stay visible. A resumed
+   strata session starts off with a notice that `/strata-on` restores the
+   pipeline (the layers live in the conversation).
 
 ## Installation
 
@@ -134,73 +68,41 @@ pi install /path/to/pi-strata
 cp -r pi-strata ~/.pi/agent/extensions/pi-strata
 ```
 
-Dependencies: only `@earendil-works/pi-coding-agent` (peer). TypeScript is
+Dependency: only `@earendil-works/pi-coding-agent` (peer). TypeScript is
 compiled by jiti in the pi runtime — no build step.
 
 ## Commands and tools
 
-- the `strata` tool (actions: `advance` / `status`); `advance` validates the
-  blocks against the branch: for the plan — a PLAN block must exist, for a
-  step — a STEP-N block; PLAN remains immutable;
+- the `strata` tool: `advance` (plan / `step=N`, with branch validation) and
+  `status`;
 - `/strata` — layer status; `/strata compact` — forced compaction;
-  `/strata reset` — clear the session directory (`tmp/`);
-- `/strata-on` — enable the strata mode for the current session (off by
-  default; per-session state, nothing is written to files; in a session with
-  context the system prompt is left untouched until the next compaction —
-  see "How it works", item 7).
+  `/strata reset` — clear `tmp/`;
+- `/strata-on` — enable the mode for the current session.
 
 ## Configuration
 
-Priority per parameter: **env > config file > default**.
-Invalid values at any level are ignored (fall-through to the next level).
+Priority: **env > settings.json > default**; invalid values are ignored.
+Files: `~/.pi/agent/settings.json` (global) and `.pi/settings.json` (project,
+overrides the global one).
 
-### File: `piStrata` in pi's settings.json
-
-| File | Scope |
-| --- | --- |
-| `~/.pi/agent/settings.json` | global |
-| `.pi/settings.json` | project (fields override the global ones) |
-
-```json
-{
-  "piStrata": {
-    "autoContinue": true,
-    "hideAnchors": true
-  }
-}
-```
-
-The on/off mode is **not a setting**: it is per-session state (off by
-default; `/strata-on` enables it for the session — see "How it works",
-item 7). A legacy `piStrata.enabled` field in settings.json and
-`PI_STRATA_ENABLED` are no longer read.
-
-### Environment variables (override the config)
-
-| Variable | Config field | Default | Description |
+| Variable | settings.json | Default | Description |
 | --- | --- | --- | --- |
-| `PI_STRATA_AUTO_CONTINUE` | `autoContinue` | on | auto-continue the next step after compaction (`0` — off) |
-| `PI_STRATA_HIDE_ANCHORS` | `hideAnchors` | on | hide STRATA anchors in the TUI transcript (display only; `0` — show them) |
-| `PI_ROOT` | — | global install | path to pi-coding-agent (self-test only) |
+| `PI_STRATA_AUTO_CONTINUE` | `piStrata.autoContinue` | on | auto-continue the step after compaction (`0` — off) |
+| `PI_STRATA_HIDE_ANCHORS` | `piStrata.hideAnchors` | on | hide STRATA anchors in the TUI transcript (`0` — show) |
+| `PI_ROOT` | — | `./node_modules` | path to pi-coding-agent (self-test only) |
 
-The effective settings are visible in `strata(action="status")` / `/strata`
-(the `settings: ...` line).
+The effective settings are visible in `/strata` (the `settings: …` line).
 
-## Structure
+## Structure and verification
 
 ```text
-index.ts      — event registration, strata tool, /strata and /strata-on commands
+index.ts      — events, strata tool, /strata and /strata-on commands
 compaction.ts — session_before_compact: plan/step/plain modes
-                (plain = strata sections + pi's standard LLM summary)
-strata.ts     — pure logic: markers, extraction, latest-wins + cycle
-                boundary (a new RESEARCH/PLAN resets the reports), summary
-                (byte-stable), round-trip, plan parsing, snapshots
-check.cjs     — self-test (61 tests)
+strata.ts     — pure logic: markers, extraction, summary (byte-stable), plan
+check.cjs     — self-test (64 tests)
 ```
 
-## Verification
-
 ```bash
-npm test              # node check.cjs (jiti + aliases as in the pi runtime)
+npm test              # node check.cjs
 npm run typecheck     # tsc --noEmit
 ```
