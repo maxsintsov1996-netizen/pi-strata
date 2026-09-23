@@ -1,14 +1,31 @@
 {
   "name": "pi-strata",
   "version": "0.1.0",
-  "description": "Layered KV-cache-friendly context management for pi-coding-agent with local LLMs (llama.cpp / Ollama). See SPEC.md.",
+  "description": "Advanced context compaction for pi-coding-agent: a phased pipeline (research → plan → steps) with a byte-stable prefix and KV-cache reuse for local LLMs.",
   "type": "module",
   "license": "MIT",
+  "keywords": ["pi-package"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maxsintsov1996-netizen/pi-strata.git"
+  },
   "pi": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/maxsintsov1996-netizen/pi-strata/master/img/pi-strata.png"
   },
+  "files": [
+    "index.ts",
+    "strata.ts",
+    "compaction.ts",
+    "config.ts",
+    "check.cjs",
+    "README.md",
+    "README.ru.md",
+    "SPEC.md",
+    "img/pi-strata.png"
+  ],
   "scripts": {
     "test": "node check.cjs",
     "typecheck": "tsc --noEmit"

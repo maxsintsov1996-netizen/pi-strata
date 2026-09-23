@@ -81,9 +81,9 @@ reports are dropped, and the new task starts with a clean history.
 ## Installation
 
 ```bash
+pi install git:github.com/maxsintsov1996-netizen/pi-strata@v0.1.0
+# or from a local checkout:
 pi install /path/to/pi-strata
-# or locally:
-cp -r pi-strata ~/.pi/agent/extensions/pi-strata
 ```
 
 Dependency: only `@earendil-works/pi-coding-agent` (peer). TypeScript is

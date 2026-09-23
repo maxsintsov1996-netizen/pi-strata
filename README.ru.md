@@ -80,9 +80,9 @@ KV-кэш (prompt-caching) между фазами.
 ## Установка
 
 ```bash
+pi install git:github.com/maxsintsov1996-netizen/pi-strata@v0.1.0
+# или из локального каталога:
 pi install /path/to/pi-strata
-# или локально:
-cp -r pi-strata ~/.pi/agent/extensions/pi-strata
 ```
 
 Зависимость: только `@earendil-works/pi-coding-agent` (peer). TypeScript
