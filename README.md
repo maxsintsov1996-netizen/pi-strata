@@ -2,121 +2,122 @@
 
 # pi-strata
 
-**Продвинутая компактизация контекста** для
-[pi-coding-agent](https://github.com/badlogic/pi-mono): фазовый пайплайн
-(исследование → план → шаги), где компактизация происходит после каждой
-фазы, а важное состояние задачи — исследование, план, отчёты по шагам —
-проходит сквозь неё без потерь.
+**Advanced context compaction** for
+[pi-coding-agent](https://github.com/badlogic/pi-mono): a phased pipeline
+(research → plan → steps) where compaction happens after every phase, while
+the task's important state — research, plan, step reports — passes through it
+unscathed.
 
-Следствие механизма: **иммутабельный, наращиваемый слоями контекст** с
-байт-стабильным префиксом — локальные LLM (llama.cpp / Ollama) переиспользуют
-KV-кэш (prompt-caching) между фазами.
+A byproduct of the mechanism: an **immutable, layer-grown context** with a
+byte-stable prefix — local LLMs (llama.cpp / Ollama) reuse the KV cache
+(prompt-caching) across phases.
 
-Спецификация: [`SPEC.md`](./SPEC.md). English version: [`README.en.md`](./README.en.md).
+Specification: [`SPEC.md`](./SPEC.md). (Russian: [`README.ru.md`](./README.ru.md).)
 
-## Идея
+## Idea
 
-Контекст агента компактизуется **по фазам**. Промпт делится на слои, где
-префикс **байт-стабилен** между шагами:
+The agent's context is compacted **phase by phase**. The prompt is divided
+into layers whose prefix is **byte-stable** across steps:
 
 ```text
-[Layer 0] системный промпт + статичные инструкции pi-strata
-  [Layer 1] /*STRATA::RESEARCH::v1*/ — отчёт исследования
-    [Layer 2] /*STRATA::PLAN::v1*/   — план (TODO-лист)
-      [Layer 3] /*STRATA::STEP-N::v1*/ — отчёты по шагам (append-only)
-        [текущее] эфемерная работа — сбрасывается в отчёты
+[Layer 0] system prompt + static pi-strata instructions
+  [Layer 1] /*STRATA::RESEARCH::v1*/ — research report
+    [Layer 2] /*STRATA::PLAN::v1*/   — plan (TODO list)
+      [Layer 3] /*STRATA::STEP-N::v1*/ — step reports (append-only)
+        [current] ephemeral work — discarded into reports
 ```
 
-Данные слоёв **не хранятся в файлах**: модель пишет каждую фазу между
-уникальными маркерами прямо в ответ, расширение вычленяет блоки (regex,
-последний блок каждого типа побеждает). Summary после компактизации —
-детерминированная сборка извлечённых блоков (round-trip): компактизация
-переписывает эфемерный контекст, важное состояние проходит как есть,
-идентичный префикс восстанавливается без файлов.
+Layer data is **not stored in files**: the model writes each phase between
+unique markers in its reply, and the extension extracts the blocks (regex,
+the last block of each type wins). The post-compaction summary is a
+deterministic assembly of the extracted blocks (round-trip): compaction
+rewrites the ephemeral context, the important state passes through as-is,
+and the identical prefix is restored without any files.
 
-Новый RESEARCH или PLAN начинает новый цикл задачи — отчёты STEP-N прежней
-задачи отбрасываются, новая задача стартует с чистой историей.
+A new RESEARCH or PLAN starts a new task cycle — the previous task's STEP-N
+reports are dropped, and the new task starts with a clean history.
 
-## Как работает
+## How it works
 
-1. Режим — **сессионное состояние, не настройка**: по умолчанию выключен,
-   включается `/strata-on` на текущую сессию (в файлы ничего не пишется,
-   команды off нет — выключенное состояние это дефолт).
-2. При включении к системному промпту добавляются инструкции Layer 0 —
-   с KV-cache guard: в сессии, которая уже несёт контекст, они сначала
-   доставляются standing-сообщением в конец разговора и переезжают в
-   системный промпт только после следующей компактизации (смена промпта
-   посреди сессии заставила бы модель перечитывать весь контекст).
-3. Пайплайн: RESEARCH → PLAN → `strata(action="advance")` → компактизация в
-   конце хода; после каждого шага — блок STEP-N с отчётом →
-   `strata(action="advance", step=N)` → компактизация. Эфемерный контекст
-   фазы компактизуется, отчёт фиксируется в слоях; план остаётся
-   неизменным, каждый его пункт самодостаточен для выполнения после
-   компактизации.
-4. Режимы компактизации: план/шаг — детерминированный layer-dump (сырой
-   контекст завершённого шага сохраняется в `<сессия>.pi_strata/tmp/` для
-   аудита, вне проекта); любая другая (overflow / ручная) — блоки слоёв +
-   стандартная LLM-суммаризация pi эфемерного хвоста поверх них (модель не
-   получает сами блоки, префикс не проходит через модель; при недоступности
-   модели — fallback на layer-dump).
-5. После компактизации шага — авто-продолжение следующего (отключается).
-   Осиротевшие каталоги удалённых сессий убираются в `session_start`
-   следующей сессии.
-6. TUI: дашборд над редактором (`strata  2/5 ✓✓▶··  next: #3 …`) и
-   индикатор режима; якоря `/*STRATA::…*/` скрыты в транскрипте
-   (display-only, настраивается), содержимое блоков видно. Возобновлённая
-   strata-сессия стартует выключенной с подсказкой, что `/strata-on`
-   восстановит пайплайн (слои живут в разговоре).
+1. The mode is **per-session state, not a setting**: off by default, enabled
+   for the current session with `/strata-on` (nothing is written to files;
+   there is no off command — off is the default).
+2. On enable, the Layer 0 instructions are added to the system prompt — with
+   a KV-cache guard: in a session that already carries context they are
+   first delivered as a standing message at the end of the conversation and
+   move into the system prompt only after the next compaction (a mid-session
+   prompt change would make the model re-read the whole context).
+3. The pipeline: RESEARCH → PLAN → `strata(action="advance")` → compaction at
+   the end of the turn; after each step — a STEP-N block with a report →
+   `strata(action="advance", step=N)` → compaction. The phase's ephemeral
+   context is compacted away, the report is recorded in the layers; the plan
+   stays immutable, and every plan item is self-contained for execution
+   after compaction.
+4. Compaction modes: plan/step — a deterministic layer dump (the raw context
+   of a completed step is saved to `<session>.pi_strata/tmp/` for auditing,
+   outside the project); any other compaction (overflow / manual) — layer
+   blocks + pi's standard LLM summarization of the ephemeral tail on top of
+   them (the model never receives the blocks themselves, so the prefix never
+   passes through the model; when no model is available — fallback to the
+   layer dump).
+5. After a step compaction — auto-continuation of the next step (can be
+   disabled). Orphaned directories of deleted sessions are cleaned up at the
+   next session's `session_start`.
+6. TUI: a dashboard above the editor (`strata  2/5 ✓✓▶··  next: #3 …`) and a
+   mode indicator; the `/*STRATA::…*/` anchors are hidden in the transcript
+   (display-only, configurable) while block bodies stay visible. A resumed
+   strata session starts off with a notice that `/strata-on` restores the
+   pipeline (the layers live in the conversation).
 
-## Что даёт
+## What you get
 
-- важное состояние задачи переживает произвольное число компактизаций —
-  отчёты STEP-N и являются информационным хранилищем;
-- байт-стабильный префикс [системный промпт + слои] → переиспользование
-  KV-кэша у локальных LLM на всех фазах;
-- детерминированные, воспроизводимые summary без файловых слоёв;
-- сырые снапшоты фаз в `tmp/` для отладки, авто-очистка за собой.
+- the task's important state survives any number of compactions — the
+  STEP-N reports are the information store;
+- a byte-stable [system prompt + layers] prefix → KV-cache reuse with local
+  LLMs across all phases;
+- deterministic, reproducible summaries without layer files;
+- raw phase snapshots in `tmp/` for debugging, with automatic cleanup.
 
-## Установка
+## Installation
 
 ```bash
 pi install /path/to/pi-strata
-# или локально:
+# or locally:
 cp -r pi-strata ~/.pi/agent/extensions/pi-strata
 ```
 
-Зависимость: только `@earendil-works/pi-coding-agent` (peer). TypeScript
-компилируется jiti в рантайме pi — сборка не нужна.
+Dependency: only `@earendil-works/pi-coding-agent` (peer). TypeScript is
+compiled by jiti in the pi runtime — no build step.
 
-## Команды и инструменты
+## Commands and tools
 
-- инструмент `strata`: `advance` (план / `step=N`, с валидацией блоков по
-  ветви) и `status`;
-- `/strata` — статус слоёв; `/strata compact` — форсированная компактизация;
-  `/strata reset` — очистить `tmp/`;
-- `/strata-on` — включить режим на текущую сессию.
+- the `strata` tool: `advance` (plan / `step=N`, with branch validation) and
+  `status`;
+- `/strata` — layer status; `/strata compact` — forced compaction;
+  `/strata reset` — clear `tmp/`;
+- `/strata-on` — enable the mode for the current session.
 
-## Конфигурация
+## Configuration
 
-Приоритет: **окружение > settings.json > default**; невалидные значения
-игнорируются. Файлы: `~/.pi/agent/settings.json` (глобальный) и
-`.pi/settings.json` (проект, переопределяет глобальный).
+Priority: **env > settings.json > default**; invalid values are ignored.
+Files: `~/.pi/agent/settings.json` (global) and `.pi/settings.json` (project,
+overrides the global one).
 
-| Переменная | settings.json | По умолчанию | Описание |
+| Variable | settings.json | Default | Description |
 | --- | --- | --- | --- |
-| `PI_STRATA_AUTO_CONTINUE` | `piStrata.autoContinue` | вкл | авто-продолжение шага после компактизации (`0` — выкл) |
-| `PI_STRATA_HIDE_ANCHORS` | `piStrata.hideAnchors` | вкл | скрывать STRATA-якоря в транскрипте TUI (`0` — показывать) |
-| `PI_ROOT` | — | `./node_modules` | путь к pi-coding-agent (только self-test) |
+| `PI_STRATA_AUTO_CONTINUE` | `piStrata.autoContinue` | on | auto-continue the step after compaction (`0` — off) |
+| `PI_STRATA_HIDE_ANCHORS` | `piStrata.hideAnchors` | on | hide STRATA anchors in the TUI transcript (`0` — show) |
+| `PI_ROOT` | — | `./node_modules` | path to pi-coding-agent (self-test only) |
 
-Эффективные настройки видны в `/strata` (строка `settings: …`).
+The effective settings are visible in `/strata` (the `settings: …` line).
 
-## Структура и проверка
+## Structure and verification
 
 ```text
-index.ts      — события, инструмент strata, команды /strata и /strata-on
-compaction.ts — session_before_compact: режимы plan/step/plain
-strata.ts     — чистая логика: маркеры, экстракция, summary (byte-stable), план
-check.cjs     — self-test (64 теста)
+index.ts      — events, strata tool, /strata and /strata-on commands
+compaction.ts — session_before_compact: plan/step/plain modes
+strata.ts     — pure logic: markers, extraction, summary (byte-stable), plan
+check.cjs     — self-test (64 tests)
 ```
 
 ```bash
