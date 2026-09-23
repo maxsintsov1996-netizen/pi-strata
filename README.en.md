@@ -2,16 +2,22 @@
 
 # pi-strata
 
-An extension for [pi-coding-agent](https://github.com/badlogic/pi-mono) that
-maximizes KV-cache (prompt-caching) reuse for local LLMs (llama.cpp / Ollama)
-via an **immutable, layer-grown context**.
+**Advanced context compaction** for
+[pi-coding-agent](https://github.com/badlogic/pi-mono): a phased pipeline
+(research → plan → steps) where compaction happens after every phase, while
+the task's important state — research, plan, step reports — passes through it
+unscathed.
+
+A byproduct of the mechanism: an **immutable, layer-grown context** with a
+byte-stable prefix — local LLMs (llama.cpp / Ollama) reuse the KV cache
+(prompt-caching) across phases.
 
 Specification: [`SPEC.md`](./SPEC.md). (Russian: [`README.md`](./README.md).)
 
 ## Idea
 
-The prompt is divided into layers whose prefix is **byte-stable** across
-steps:
+The agent's context is compacted **phase by phase**. The prompt is divided
+into layers whose prefix is **byte-stable** across steps:
 
 ```text
 [Layer 0] system prompt + static pi-strata instructions
@@ -23,10 +29,13 @@ steps:
 
 Layer data is **not stored in files**: the model writes each phase between
 unique markers in its reply, and the extension extracts the blocks (regex,
-the last block of each type wins). A new RESEARCH or PLAN starts a new task
-cycle — the previous task's STEP-N reports are dropped. The post-compaction
-summary is a deterministic assembly of the extracted blocks, so the identical
-prefix is restored without any files (round-trip).
+the last block of each type wins). The post-compaction summary is a
+deterministic assembly of the extracted blocks (round-trip): compaction
+rewrites the ephemeral context, the important state passes through as-is,
+and the identical prefix is restored without any files.
+
+A new RESEARCH or PLAN starts a new task cycle — the previous task's STEP-N
+reports are dropped, and the new task starts with a clean history.
 
 ## How it works
 
@@ -38,27 +47,36 @@ prefix is restored without any files (round-trip).
    first delivered as a standing message at the end of the conversation and
    move into the system prompt only after the next compaction (a mid-session
    prompt change would make the model re-read the whole context).
-3. The agent follows the marker protocol: RESEARCH → PLAN →
-   `strata(action="advance")` → compaction at the end of the turn; after
-   each step — a STEP-N block with a report → `strata(action="advance",
-   step=N)` → compaction. The plan stays immutable, progress is recorded in
-   reports only; every plan item is self-contained for execution after
-   compaction.
-4. Strata-session compaction: the strata sections are assembled
-   deterministically from the markers; any other compaction (overflow /
-   manual) — layer blocks + pi's standard LLM summarization of the ephemeral
-   span on top of them (the model never receives the blocks themselves, so
-   the stable prefix never passes through the model). When no model is
-   available — fallback to the plain layer dump.
+3. The pipeline: RESEARCH → PLAN → `strata(action="advance")` → compaction at
+   the end of the turn; after each step — a STEP-N block with a report →
+   `strata(action="advance", step=N)` → compaction. The phase's ephemeral
+   context is compacted away, the report is recorded in the layers; the plan
+   stays immutable, and every plan item is self-contained for execution
+   after compaction.
+4. Compaction modes: plan/step — a deterministic layer dump (the raw context
+   of a completed step is saved to `<session>.pi_strata/tmp/` for auditing,
+   outside the project); any other compaction (overflow / manual) — layer
+   blocks + pi's standard LLM summarization of the ephemeral tail on top of
+   them (the model never receives the blocks themselves, so the prefix never
+   passes through the model; when no model is available — fallback to the
+   layer dump).
 5. After a step compaction — auto-continuation of the next step (can be
-   disabled). Raw context of completed steps goes to
-   `<session>.pi_strata/tmp/` (outside the project); orphaned directories of
-   deleted sessions are cleaned up at the next session's `session_start`.
+   disabled). Orphaned directories of deleted sessions are cleaned up at the
+   next session's `session_start`.
 6. TUI: a dashboard above the editor (`strata  2/5 ✓✓▶··  next: #3 …`) and a
    mode indicator; the `/*STRATA::…*/` anchors are hidden in the transcript
    (display-only, configurable) while block bodies stay visible. A resumed
    strata session starts off with a notice that `/strata-on` restores the
    pipeline (the layers live in the conversation).
+
+## What you get
+
+- the task's important state survives any number of compactions — the
+  STEP-N reports are the information store;
+- a byte-stable [system prompt + layers] prefix → KV-cache reuse with local
+  LLMs across all phases;
+- deterministic, reproducible summaries without layer files;
+- raw phase snapshots in `tmp/` for debugging, with automatic cleanup.
 
 ## Installation
 
