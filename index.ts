@@ -719,7 +719,6 @@ export default function (pi: ExtensionAPI) {
       // protect).
       deferSystemPrompt = branchHasContext(ctx);
       updateWidget(ctx);
-      if (!ctx.hasUI) return;
       const layers = extractLayers(branchText(ctx));
       const hasLayers = Boolean(layers && (layers.research || layers.plan));
       if (deferSystemPrompt) {
@@ -733,12 +732,14 @@ export default function (pi: ExtensionAPI) {
         );
         // Resumed/forked strata sessions re-announce the layer state, as
         // before; plain sessions get the generic notice only.
-        ctx.ui.notify(
-          `pi-strata: enabled — standing instructions queued at the end of the context; the system prompt picks them up after the next compaction (KV cache preserved).${hasLayers ? ` ${statusText(ctx)}` : ""}`,
-          "info",
-        );
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            `pi-strata: enabled — standing instructions queued at the end of the context; the system prompt picks them up after the next compaction (KV cache preserved).${hasLayers ? ` ${statusText(ctx)}` : ""}`,
+            "info",
+          );
         return;
       }
+      if (!ctx.hasUI) return;
       if (hasLayers) {
         // Session already carries strata layers (resumed/forked): re-announce
         // the current state instead of a generic notice.

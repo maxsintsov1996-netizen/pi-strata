@@ -1443,6 +1443,37 @@ const main = async () => {
     );
   });
 
+  await test("strata-on queues instructions for an existing headless session", async () => {
+    const sent = [];
+    const h = {};
+    const cmds = {};
+    factory({
+      on: (name, handler) => {
+        h[name] ??= [];
+        h[name].push(handler);
+      },
+      registerTool: () => {},
+      registerCommand: (name, def) => {
+        cmds[name] = def;
+      },
+      registerMarkdownTransformer: () => {},
+      registerMessageRenderer: () => {},
+      sendUserMessage: () => {},
+      sendMessage: (msg, opts) => sent.push({ msg, opts }),
+    });
+    const ctx = { ...tCtx, hasUI: false };
+    h.session_start[0]({ type: "session_start" }, ctx);
+    branch.length = 0;
+    branch.push(branchMsg("earlier work", "headless-1"));
+
+    await cmds["strata-on"].handler("", ctx);
+
+    assert.equal(sent.length, 1, "instructions queued without a TUI");
+    assert.deepEqual(sent[0].opts, { deliverAs: "nextTurn" });
+    assert.equal(sent[0].msg.customType, "strata-instructions");
+    assert.ok(sent[0].msg.content.includes("/*STRATA::STEP-N::v1*/"));
+  });
+
   await test("strata-on on an empty session updates the system prompt immediately", async () => {
     const sent = [];
     const h = {};
