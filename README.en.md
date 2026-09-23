@@ -1,4 +1,4 @@
-<p align="center"><img src="./pi-strata.png" alt="pi-strata" width="180"></p>
+<p align="center"><img src="./img/pi-strata.png" alt="pi-strata" width="180"></p>
 
 # pi-strata
 
