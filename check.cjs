@@ -34,9 +34,18 @@ const { tmpdir } = require("node:os");
 const { dirname, join } = require("node:path");
 
 const here = __dirname;
-const PI_ROOT =
-  process.env.PI_ROOT ??
-  "/home/max/.npm-global/lib/node_modules/@earendil-works/pi-coding-agent";
+// pi-coding-agent is a peer dependency: resolve the local install from this
+// project's node_modules; PI_ROOT overrides (e.g. a global pi install).
+function resolvePiRoot() {
+  // A plain directory check: pi-coding-agent's exports map has no "require"
+  // condition, so require.resolve() refuses to find it from CJS.
+  const local = join(here, "node_modules", "@earendil-works", "pi-coding-agent");
+  if (existsSync(join(local, "package.json"))) return local;
+  throw new Error(
+    "pi-coding-agent not found in ./node_modules — install the peer deps (npm i) or set PI_ROOT to the pi-coding-agent install directory",
+  );
+}
+const PI_ROOT = process.env.PI_ROOT ?? resolvePiRoot();
 
 const piRequire = createRequire(join(PI_ROOT, "package.json"));
 const { createJiti } = piRequire("jiti");
