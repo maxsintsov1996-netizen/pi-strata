@@ -4,7 +4,17 @@
   "description": "Advanced context compaction for pi-coding-agent: a phased pipeline (research → plan → steps) with a byte-stable prefix and KV-cache reuse for local LLMs.",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package"],
+  "keywords": ["pi-package", "pi", "pi-coding-agent", "context", "compaction", "kv-cache", "llm"],
+  "homepage": "https://github.com/maxsintsov1996-netizen/pi-strata#readme",
+  "bugs": {
+    "url": "https://github.com/maxsintsov1996-netizen/pi-strata/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/maxsintsov1996-netizen/pi-strata.git"

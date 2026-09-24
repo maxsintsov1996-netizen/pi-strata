@@ -80,6 +80,8 @@ KV-кэш (prompt-caching) между фазами.
 ## Установка
 
 ```bash
+pi install npm:pi-strata
+# или из git (зафиксированный ref):
 pi install git:github.com/maxsintsov1996-netizen/pi-strata@v0.1.0
 # или из локального каталога:
 pi install /path/to/pi-strata

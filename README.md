@@ -81,6 +81,8 @@ reports are dropped, and the new task starts with a clean history.
 ## Installation
 
 ```bash
+pi install npm:pi-strata
+# or from git (pinned ref):
 pi install git:github.com/maxsintsov1996-netizen/pi-strata@v0.1.0
 # or from a local checkout:
 pi install /path/to/pi-strata
